@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Viking Fjord</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;}
+  #c{position:fixed;inset:0;display:block;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+window.__VF_REV = 5;   // version marker for verification
+/* ============================================================
+   VIKING FJORD — a self-contained WebGL low-poly scene.
+   Golden-hour dawn, endless dolly shot. No external deps.
+   ============================================================ */
+
+var cvs = document.getElementById('c');
+var gl = cvs.getContext('webgl2') || cvs.getContext('webgl') || cvs.getContext('experimental-webgl');
+if (!gl) { cvs.parentNode.replaceChild(
+  (function(){ var d=document.createElement('div');
+    d.style.cssText='color:#fff;font:14px sans-serif;padding:20px;';
+    d.textContent='WebGL unavailable in this browser.'; return d; }()), cvs); }
+else main();
+
+function main(){
+  /* ---------------- tiny matrix library (column-major) ---------------- */
+  function nrm(a,b,c){
+    var ux=b[0]-a[0], uy=b[1]-a[1], uz=b[2]-a[2];
+    var vx=c[0]-a[0], vy=c[1]-a[1], vz=c[2]-a[2];
+    var nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+    var L=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+    return [nx/L,ny/L,nz/L];
+  }
+  function persp(out,fovy,asp,n,f){
+    var t=1/Math.tan(fovy/2);
+    out[0]=t/asp;out[1]=0;out[2]=0;out[3]=0;
+    out[4]=0;out[5]=t;out[6]=0;out[7]=0;
+    out[8]=0;out[9]=0;out[10]=(f+n)/(n-f);out[11]=-1;
+    out[12]=0;out[13]=0;out[14]=(2*f*n)/(n-f);out[15]=0;
+  }
+  function lookAt(out,eye,ctr,up){
+    var zx=eye[0]-ctr[0], zy=eye[1]-ctr[1], zz=eye[2]-ctr[2];
+    var zl=Math.sqrt(zx*zx+zy*zy+zz*zz)||1; zx/=zl;zy/=zl;zz/=zl;
+    var ux=up[0],uy=up[1],uz=up[2];
+    // x = up x z
+    var x0=uy*zz-uz*zy, x1=uz*zx-ux*zz, x2=ux*zy-uy*zx;
+    var xl=Math.sqrt(x0*x0+x1*x1+x2*x2)||1; x0/=xl;x1/=xl;x2/=xl;
+    // y = z x x
+    var y0=zy*x2-zz*x1, y1=zz*x0-zx*x2, y2=zx*x1-zy*x0;
+    out[0]=x0;out[4]=x1;out[8]=x2;out[12]=-(x0*eye[0]+x1*eye[1]+x2*eye[2]);
+    out[1]=y0;out[5]=y1;out[9]=y2;out[13]=-(y0*eye[0]+y1*eye[1]+y2*eye[2]);
+    out[2]=zx;out[6]=zy;out[10]=zz;out[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+    out[3]=0;out[7]=0;out[11]=0;out[15]=1;
+  }
+  function mmul(a,b){
+    var c=new Float32Array(16);
+    for(var col=0;col<4;col++)for(var row=0;row<4;row++){
+      c[col*4+row]=a[0+row]*b[col*4+0]+a[4+row]*b[col*4+1]
+                +a[8+row]*b[col*4+2]+a[12+row]*b[col*4+3];
+    }
+    return c;
+  }
+  function Rx(a){var c=Math.cos(a),s=Math.sin(a);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);}
+  function Ry(a){var c=Math.cos(a),s=Math.sin(a);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);}
+  function Rz(a){var c=Math.cos(a),s=Math.sin(a);
+    return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]);}
+  function trans(m,tx,ty,tz){var o=new Float32Array(m);o[12]=tx;o[13]=ty;o[14]=tz;return o;}
+  function tPoint(m,p){
+    return [m[0]*p[0]+m[4]*p[1]+m[8]*p[2]+m[12],
+            m[1]*p[0]+m[5]*p[1]+m[9]*p[2]+m[13],
+            m[2]*p[0]+m[6]*p[1]+m[10]*p[2]+m[14]];
+  }
+
+  /* ---------------- shader helpers ---------------- */
+  function sh(type,src){
+    var s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(s);
+    return s;
+  }
+  function prog(vs,fs,binds){
+    var p=gl.createProgram();
+    gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));
+    gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));
+    binds.forEach(function(b,i){gl.bindAttribLocation(p,i,b);});
+    gl.linkProgram(p);
+    if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw gl.getProgramInfoLog(p);
+    return p;
+  }
+  function loc(p,n){return gl.getUniformLocation(p,n);}
+
+  /* ---------------- main solid shader ---------------- */
+  var VS='attribute vec3 aP;attribute vec3 aN;attribute vec3 aC;attribute float aA;'+
+     'uniform mat4 uPV;varying vec3 vN;varying vec3 vC;varying vec3 vW;varying float vA;'+
+     'void main(){vN=aN;vC=aC;vA=aA;vW=aP;gl_Position=uPV*vec4(aP,1.0);}';
+  var FS='precision mediump float;varying vec3 vN;varying vec3 vC;varying vec3 vW;varying float vA;'+
+     'uniform vec3 uL,uE,uFogC;uniform float uFn,uFf;'+
+     'void main(){'+
+       'vec3 n=normalize(vN);'+
+       'float d=max(dot(n,uL),0.0);'+
+       'float amb=0.46;'+
+       'vec3 Lv=normalize(uE-vW);'+
+       'float rim=pow(1.0-abs(dot(Lv,n)),3.0)*0.30;'+
+       'vec3 col=vC*(amb+0.80*d)+vec3(0.46,0.30,0.20)*rim;'+
+       'float gl=pow(d,22.0);col+=vec3(1.0,0.85,0.58)*gl*0.4;'+
+       'float fd=length(uE-vW);'+
+       'float f=smoothstep(uFn,uFf,fd);'+
+       'col=mix(col,uFogC,clamp(f,0.0,1.0));'+
+       'gl_FragColor=vec4(col,vA);}';
+  var P=prog(VS,FS,['aP','aN','aC','aA']);
+  var uPV=loc(P,'uPV'),uL=loc(P,'uL'),uE=loc(P,'uE'),uFogC=loc(P,'uFogC'),
+      uFn=loc(P,'uFn'),uFf=loc(P,'uFf');
+
+  /* ---------------- sky-sun glow shader (screen-space billboard) ---------------- */
+  var SV='attribute vec2 aP;varying vec2 vP;'+
+    'void main(){vP=aP;gl_Position=vec4(aP,0.0,1.0);}';
+  var SF='precision mediump float;varying vec2 vP;'+
+    'uniform vec3 uR,uU,uB,uS,uCol;uniform float uAz,uAy,uPow,uIv;'+
+    'void main(){'+
+      'vec3 dd=normalize(uR*(vP.x*uAz)+uU*(vP.y*uAy)+uB);'+
+      'float s=clamp(dot(dd,uS),0.0,1.0);'+
+      'float g=pow(s,uPow)*uIv;'+
+      'gl_FragColor=vec4(uCol*g,g);}';
+  var P2=prog(SV,SF,['aP']);
+  var uR=loc(P2,'uR'),uU=loc(P2,'uU'),uB2=loc(P2,'uB'),uS=loc(P2,'uS'),
+      uCol=loc(P2,'uCol'),uAz=loc(P2,'uAz'),uAy=loc(P2,'uAy'),
+      uPow=loc(P2,'uPow'),uIv=loc(P2,'uIv');
+
+  /* ---------------- geometry builders ---------------- */
+  function arr(){return [];}
+  var pitchCntr=0;
+  function t3(a,b,c,cr,cg,cb, n,i){
+    if(i===undefined)n=nrm(a,b,c);
+    n[0]*=1; // already normal
+    a.forEach(function(v){i.push(v)});
+    i.push(n[0],n[1],n[2],cr,cg,cb,1);
+    b.forEach(function(v){i.push(v)});
+    i.push(n[0],n[1],n[2],cr,cg,cb,1);
+    c.forEach(function(v){i.push(v)});
+    i.push(n[0],n[1],n[2],cr,cg,cb,1);
+  }
+  function q(a,b,c,d,cr,cg,cb,i){
+    var n=nrm(a,b,c);
+    t3(a,b,c,cr,cg,cb,n,i); t3(a,c,d,cr,cg,cb,n,i);
+  }
+  function qc(i,a,b,c,d,cA,cB,cC,cD){
+    var n=nrm(a,b,c);
+    t2(i,a,cA,n); t2(i,b,cB,n); t2(i,c,cC,n);
+    t2(i,a,cA,n); t2(i,c,cC,n); t2(i,d,cD,n);
+  }
+  function t2(i,v,c,n){ v.forEach(function(x){i.push(x)}); i.push(n[0],n[1],n[2],c[0],c[1],c[2],1); }
+  function tA(i,a,b,c,cr,cg,cb,alpha){
+    var n=nrm(a,b,c);
+    a.forEach(function(v){i.push(v)}); i.push(n[0],n[1],n[2],cr,cg,cb,alpha);
+    b.forEach(function(v){i.push(v)}); i.push(n[0],n[1],n[2],cr,cg,cb,alpha);
+    c.forEach(function(v){i.push(v)}); i.push(n[0],n[1],n[2],cr,cg,cb,alpha);
+  }
+  function T(P,mat){
+    var ox=P[0],oy=P[1];
+    var s=Math.sin(oy),c=Math.cos(oy);
+    var v=[ox*c, P[1], ox*s];
+    return tPoint(mat,v);
+  }
+  // box centered at origin with half-extents hx,hy,hz -> 6 faces outward
+  function box(i,hx,hy,hz,r,g,b,ox,oy,oz,rx,ry,rz){
+    var m=mmul(Rz(rz),mmul(Ry(ry),Rx(rx)));
+    m=trans(m,ox,oy,oz);
+    function pt(x,y,z){return tPoint(m,[x,y,z]);}
+    var p=[
+      pt(-hx,-hy,-hz),pt( hx,-hy,-hz),pt( hx, hy,-hz),pt(-hx, hy,-hz), // back
+      pt(-hx,-hy, hz),pt( hx,-hy, hz),pt( hx, hy, hz),pt(-hx, hy, hz)  // front
+    ];
+    boom(i,p,0,2,1,3,r,g,b); // -z
+    boom(i,p,4,5,6,7,r,g,b); // +z
+    boom(i,p,1,6,5,2,r,g,b); // +x
+    boom(i,p,4,3,0,7,r,g,b); // -x
+    boom(i,p,3,6,2,7,r,g,b); // +y
+    boom(i,p,0,1,5,4,r,g,b); // -y
+  }
+  function boom(i,p,ia,ib,ic,id,r,g,b){
+    // quad with outward normal computed from CCW a,b,c
+    var a=p[ia],b=p[ib],c=p[ic],d=p[id];
+    var n=nrm(a,b,c);
+    t3(a,b,c,r,g,b,n,i); t3(c,d,a,r,g,b,n,i);
+  }
+
+  /* ---------------- palette / state ---------------- */
+  var FOG=[0.98,0.80,0.60];            // warm golden-dawn haze
+  var LIGHT=[0.30,0.20,0.93];          // low warm sun, lights the hero faces
+  var ll=Math.sqrt(LIGHT[0]*LIGHT[0]+LIGHT[1]*LIGHT[1]+LIGHT[2]*LIGHT[2]);
+  LIGHT=[LIGHT[0]/ll,LIGHT[1]/ll,LIGHT[2]/ll];
+  var SUNX=-LIGHT[0], SUNY=-LIGHT[1], SUNZ=-LIGHT[2]; // toward the sun (world)
+
+  var W=[];
+  for(var i=0;i<240;i++)W.push({x:0,z:0,y:0,w:0.4,len:1.0,a:0,life:0,age:9}); // wake particles
+
+  /* ---- static world geometry (built once) ---- */
+  var STAT=[];
+  // distant snow peaks
+  var peak=[]
+  ;(function(){
+    var PR=[
+      [-150,-305,52,40,150,[0.72,0.66,0.80]],[ -78,-320,70,55,190,[0.70,0.64,0.78]],
+      [  -8,-330,86,62,230,[0.74,0.68,0.82]],[  74,-318,64,58,175,[0.68,0.62,0.78]],
+      [ 150,-302,44,38,140,[0.71,0.65,0.80]],[ -52,0,0,0,0,[0,0,0]],
+      [ -110,-346,92,58,210,[0.72,0.66,0.80]],[  40,-348,96,60,200,[0.73,0.67,0.81]],
+      [   0,-368,120,70,255,[0.75,0.69,0.83]],[ -150,-368,70,46,165,[0.70,0.64,0.78]],
+      [  150,-352,64,42,150,[0.69,0.63,0.77]]
+    ];
+    for(var i=0;i<PR.length;i++){
+      var p=PR[i]; if(p[3]===0)continue;
+      var xa=p[0], xb=p[0]+p[3]*2, apexX=p[0]+p[3], z=p[1], h=p[4], col=p[5];
+      var ax=apexX, az=z-18;
+      var A=[xa,-8,z], B=[ax,h,az], C=[xb,-8,z], D=[ax+tiny(2),-8,z-12];
+      var base=p[2];
+      t3(A,B,C,col[0],col[1],col[2],nrm(A,B,C),STAT);
+      t3(D,C,B,col[0]*0.82,col[1]*0.82,col[2]*0.85,nrm(D,C,B),STAT);
+      // snow cap
+      var serr=0;
+      var sx=apexX, sz=z-12, sy=h*0.55+ (pr(1))*6;
+      var snow=[0.96,0.95,0.93];
+      var sA=[apexX-12,sy,sz], sB=[ax,h,az], sC=[apexX+12,sy,sz];
+      t3(sA,sB,sC,snow[0],snow[1],snow[2],nrm(sA,sB,sC),STAT);
+    }
+  })();
+  function tiny(x){return (Math.random()-0.5)*x;}
+  function pr(x){return Math.random();}
+
+  // fjord walls
+  (function(){
+    function wall(side){
+      var x0=side*78;
+      var totalH=46;
+      var zStart=-265, zEnd=150, seg=26;
+      var nseg=Math.round((zEnd-zStart)/seg);
+      var zs=[];
+      for(var s=0;s<=nseg;s++){
+        var z=zStart+s*seg;
+        var h= z*-0.06 + 56 + tiny(14); if(h<34)h=34;
+        var off=side*(6+tiny(8));
+        zs.push({z:z,xi:x0+off, h:h});
+      }
+      for(var s=0;s<nseg;s++){
+        var A0=zs[s], A1=zs[s+1];
+        var xo= (A0.z<zStart+nseg*seg*0.5)? side*(A0.xi+ (side>0?14:-14)) : side*(A0.xi+(side>0?16:-16));
+        // inner face (facing center)
+        var xin=A0.xi;
+        var yb=0.0;
+        var hA=A0.h, hB=A1.h;
+        var cH= 20+s*tiny(0);
+        // choose per segment color: slate/brown/green mix
+        var col= [0.44,0.38,0.33];
+        if(s%3===0)col=[0.40,0.43,0.40];
+        if(s%7===0)col=[0.50,0.40,0.33];
+        // tapered block: inner bottom edge, inner top edge, outer top edge, outer bottom edge
+        var innerTopA=[xin,yb+hA,A0.z], innerTopB=[xin,yb+hB,A1.z];
+        var outerTopA=[xo,yb+hA+ (side>0?-4:4)+tiny(3),A0.z], outerTopB=[xo,yb+hB+ (side>0?-4:4)+tiny(3),A1.z];
+        var bota=[xo,yb-6,A0.z], botb=[xo,yb-6,A1.z];
+        var inbota=[xin,yb-6,A0.z], inbotb=[xin,yb-6,A1.z];
+        // main side face (towards center): normal ~ +-x
+        q(innerTopA,innerTopB,inbotb,inbota,col[0],col[1],col[2],STAT);
+        // top slab (ridge)
+        q(innerTopA,outerTopA,outerTopB,innerTopB, col[0]*0.74,col[1]*0.74,col[2]*0.76, STAT);
+        // outer face shade
+        q(outerTopA,bota,botb,outerTopB, col[0]*0.5,col[1]*0.5,col[2]*0.55, STAT);
+        // snow cap when high
+        if(hA>72){
+          var snY=66;
+          q([xin*0.995,snY,A0.z],[xo*1.002,snY+2,A0.z],[xo*1.002,snY+2,A1.z],[xin*0.995,snY,A1.z],
+            0.95,0.95,0.94,STAT);
+        }
+        // moss ledges ~ step
+        if(s%4===1){
+          var ly= hA*0.35;
+          var lx= xin + (side>0?-4:4);
+          box(STAT, side>0?3:3*0+1,1,14, 0.22,0.30,0.22, xin + (side>0)*4 - (side>0?-2:2) , ly, (A0.z+A1.z)/2, 0,0,0);
+        }
+      }
+    }
+    wall(-1); wall(1);
+  })();
+
+  // foreground rocks / reefs for depth framing (bottom corners + near center-bottom)
+  (function(){
+    function reef(x,y,z,sc,r,g,b,tilt,spin){
+      var m=mmul(Rz(tilt),Ry(spin));
+      var pts=[[-1,-0.2,-1],[ 1,-0.2,-1],[ 1,-0.2, 1],[-1,-0.2, 1]];
+      var top=[[ -0.5,1,-0.7],[ 0.6,0.7,-0.4],[0.3,1.4,0.6],[-0.6,0.6,0.7]];
+      var P=pts.map(function(p){return tPoint(m,[p[0]*sc,p[1]*sc,p[2]*sc])});
+      var Pt=pts.map(function(p){var k=p[0]>=0?(p[2]>=0?0.35:0.2):(p[2]>=0?-0.2:-0.45);return tPoint(m,[p[0]*sc*0.9,k*sc*1.6,p[2]*sc*0.9])});
+      // 4 side faces + top
+      function T(pts){return pts.map(function(p){p[0]+=x;p[1]+=y;p[2]+=z;return p;});}
+      var sideC=[r*0.5,g*0.5,b*0.5], topC=[r,g,b];
+      var A=T(pts.map(function(p){return tPoint(m,[p[0]*sc,p[1]*sc,p[2]*sc]);}));
+      var B=T(pts.map(function(p){var sh=(p[0]*p[2])*0.6; return tPoint(m,[p[0]*sc*0.85,p[1]*sc+ (1+Math.abs(p[0])+Math.abs(p[2]))*sc*0.75+sh*0.2,p[2]*sc*0.85]);}));
+      q(A[0],A[1],B[1],B[0],sideC[0],sideC[1],sideC[2],STAT);
+      q(A[1],A[2],B[2],B[1],sideC[0]*0.9,sideC[1]*0.9,sideC[2]*0.9,STAT);
+      q(A[2],A[3],B[3],B[2],sideC[0]*0.8,sideC[1]*0.8,sideC[2]*0.8,STAT);
+      q(A[3],A[0],B[0],B[3],sideC[0]*0.95,sideC[1]*0.95,sideC[2]*0.95,STAT);
+      q(B[0],B[1],B[2],B[3],topC[0],topC[1],topC[2],STAT);
+    }
+    reef(-118,-2,-46,30,0.42,0.34,0.30,0.10,0.4);
+    reef( 120,-2,-34,34,0.40,0.32,0.28,0.12,1.2);
+  })();
+
+  /* ---- sky dome ---- */
+  function buildSky(sky,eye){
+    var R=900, rings=5, seg=24;
+    for(var r=0;r<rings;r++){
+      var lat0=r/rings*Math.PI/2;         // 0..90 up
+      var lat1=(r+1)/rings*Math.PI/2;
+      for(var s=0;s<seg;s++){
+        var a0=s/seg*Math.PI*2, a1=(s+1)/seg*Math.PI*2;
+        // sample 4 corners
+        function skyPt(lat,aa){
+          var x=Math.cos(aa)*Math.cos(lat), y=Math.sin(lat), z=Math.sin(aa)*Math.cos(lat);
+          return [eye[0]+x*R, eye[1]+y*R, eye[2]+z*R];
+        }
+        // color by world Y (gradient zenith->horizon)
+        function skyCol(lat){
+          var t=(lat)/(Math.PI/2);
+          // dawn: cool-blue zenith -> rose -> golden horizon
+          var c;
+          if(t<0.55){ c=[0.26,0.30,0.55]; }
+          else if(t<0.85){ c=[0.80,0.60,0.64]; }
+          else { c=[1.0,0.80,0.58]; }
+          return c;
+        }
+        var A=skyPt(lat0,a0),B=skyPt(lat0,a1),C=skyPt(lat1,a1),D=skyPt(lat1,a0);
+        var cA=skyCol(lat0), cB=skyCol(lat0), cC=skyCol(lat1), cD=skyCol(lat1);
+        var n=nrm(A,B,C);
+        t2(sky,A,cA,n); t2(sky,B,cB,n); t2(sky,C,cC,n);
+        t2(sky,A,cA,n); t2(sky,C,cC,n); t2(sky,D,cD,n);
+      }
+    }
+  }
+
+  /* ---- water (dynamic) ---- */
+  var WATERBOUNDS={x0:-172,x1:172,z0:-300,z1:250,nx:72,nz:72};
+  function waveY(x,z,t){
+    return 0.20*Math.sin(x*0.048+t*1.05)
+         + 0.16*Math.sin(z*0.05 -t*0.85 +1.8)
+         + 0.10*Math.sin((x+z)*0.028+t*0.5)
+         + 0.06*Math.sin(x*0.11-t*1.25);
+  }
+  function waterNormal(xc,zc,t){
+    var e=0.6;
+    var Hd=waveY(xc,zc+e,t)-waveY(xc,zc-e,t);
+    var Hx=waveY(xc+e,zc,t)-waveY(xc-e,zc,t);
+    var dx=-Hx/(2*e), dz=-Hd/(2*e);
+    var l=Math.sqrt(dx*dx+1+dz*dz)||1;
+    return [dx/l,1/l,dz/l];
+  }
+  function buildWater(W2,t){
+    var bx=WATERBOUNDS;
+    var gx=(bx.x1-bx.x0)/bx.nx, gz=(bx.z1-bx.z0)/bx.nz;
+    var hs=[];
+    for(var i=0;i<=bx.nx;i++){hs.push([]);for(var j=0;j<=bx.nz;j++){hs[i].push(0.0);}}
+    var zz=bx.z0;
+    for(var jj=0;jj<=bx.nz;jj++,zz+=gz){
+      var xx=bx.x0;
+      for(var ii=0;ii<=bx.nx;ii++,xx+=gx){
+        hs[ii][jj]=waveY(xx,zz,t);
+      }
+    }
+    var deep=[0.20,0.32,0.44], light=[0.60,0.74,0.82];
+    var en=0.5;
+    function wN(x,z){ // per-vertex smooth normal
+      var Hd=waveY(x,z+en,t)-waveY(x,z-en,t);
+      var Hx=waveY(x+en,z,t)-waveY(x-en,z,t);
+      var dx=-Hx/(2*en), dz=-Hd/(2*en);
+      var l=Math.sqrt(dx*dx+1+dz*dz)||1;
+      return [dx/l,1/l,dz/l];
+    }
+    function V(x,y,z,nx,ny,nz,cr,cg,cb){W2.push(x,y,z,nx,ny,nz,cr,cg,cb,1);}
+    for(var j=0;j<bx.nz;j++){
+      for(var i=0;i<bx.nx;i++){
+        var x0=bx.x0+i*gx, x1=x0+gx, z0=bx.z0+j*gz, z1=z0+gz;
+        var y00=hs[i][j],y10=hs[i+1][j],y11=hs[i+1][j+1],y01=hs[i][j+1];
+        var hA=(y00+y10+y11+y01)/4;
+        var k=Math.max(0,Math.min(1,(hA+0.3)/0.75));
+        var cr=deep[0]+(light[0]-deep[0])*k, cg=deep[1]+(light[1]-deep[1])*k, cb=deep[2]+(light[2]-deep[2])*k;
+        var nA=wN(x0,z0),nB=wN(x1,z0),nC=wN(x1,z1),nD=wN(x0,z1);
+        V(x0,y00,z0,nA[0],nA[1],nA[2],cr,cg,cb);
+        V(x1,y10,z0,nB[0],nB[1],nB[2],cr,cg,cb);
+        V(x1,y11,z1,nC[0],nC[1],nC[2],cr,cg,cb);
+        V(x0,y00,z0,nA[0],nA[1],nA[2],cr,cg,cb);
+        V(x1,y11,z1,nC[0],nC[1],nC[2],cr,cg,cb);
+        V(x0,y01,z1,nD[0],nD[1],nD[2],cr,cg,cb);
+      }
+    }
+  }
+
+  /* ---- ship (dynamic, in world coords) ---- */
+  function shipModel(shipX,shipZ,t,boatY,roll,pitch){
+      var S=1.7;   // global ship scale
+      var e=mmul(Rz(roll),mmul(Ry(pitch),Rx(0)));
+      // nose points toward -Z (forward). Rotate 180 so local +? we keep geometry facing -z.
+      e=mmul(e,Ry(Math.PI));
+      // scale
+      var sc=new Float32Array([S,0,0,0, 0,S,0,0, 0,0,S,0, 0,0,0,1]);
+      e=mmul(sc,e);
+            return trans(e,shipX,boatY,shipZ);
+          }
+        function dragonJaw(mat,i){
+            // curved neck rising from the bow, ending in a stylized dragon head
+            var neck=[
+              [ 0.0,0.9,-3.45,0.20,0.20,0.55, 0.0],
+              [-0.10,1.5,-3.85,0.18,0.18,0.55, 0.25],
+              [-0.22,2.1,-4.25,0.16,0.16,0.55, 0.5],
+              [-0.35,2.7,-4.6,0.14,0.14,0.55, 0.75],
+              [-0.5,3.25,-4.9,0.12,0.12,0.55, 1.0]
+            ];
+            var g=[0.22,0.34,0.20];
+            for(var k=0;k<neck.length;k++){
+              var p=neck[k];
+              var o=tPoint(mat,[p[0],p[1],p[2]]);
+              box(i,p[3],p[4],p[5], g[0],g[1],g[2], o[0],o[1],o[2], p[6]*0.5, -0.15, 0);
+            }
+            // head
+            var hx=tPoint(mat,[-0.62,3.6,-5.1]);
+            box(i,0.20,0.20,0.6, 0.24,0.38,0.22, hx[0],hx[1],hx[2], 0.3,-0.2,0.1);
+            // snout curling down/forward
+            var sn=tPoint(mat,[-0.78,3.5,-5.4]);
+            box(i,0.12,0.12,0.5, 0.26,0.40,0.24, sn[0],sn[1],sn[2], 0.9,-0.1,0.2);
+            // gold eye
+            var eye=tPoint(mat,[-0.6,3.55,-5.0]);
+            box(i,0.02,0.05,0.04, 0.95,0.75,0.3, eye[0],eye[1]+0.02,eye[2]+0.2, 0,0,0);
+            // nostril
+            var no=tPoint(mat,[-0.8,3.5,-5.5]);
+            box(i,0.02,0.03,0.03, 0.1,0.1,0.1, no[0],no[1],no[2], 0,0,0);
+          }
+  function buildShip(S,i,shipX,shipZ,t){
+    var boatY=waveY(shipX,shipZ,t)+0.05*Math.sin(t*1.2);
+    var roll=0.055*Math.sin(t*0.7+0.4);
+    var pitch=0.04*Math.sin(t*0.9)+0.02*Math.sin(t*2.3);
+    var M=shipModel(shipX,shipZ,t,boatY,roll,pitch);
+    var tip=0;
+
+    // ---- hull: build in local (points) then transform ----
+    var L=3.4;
+    function bAt(s){ return 0.92*Math.pow(1-Math.pow(Math.abs(s)/L,2.2),1)+0.18; }
+    function ygAt(s){ return 0.30+0.62*(Math.abs(s)/L)+0.04; }
+    function ycAt(s){ return -0.24-0.05*(1-Math.abs(s)/L); }
+    function ykAt(s){ return ycAt(s)-0.11; }
+    var NS=9;
+    function st(s){
+      return {s:s, b:bAt(s), yg:ygAt(s), yc:ycAt(s), yk:ykAt(s)};
+    }
+    var stations=[];
+    for(var k=0;k<=NS;k++)stations.push(st(-L+L*2*k/NS));
+    // side panels + bottom
+    var wood=[0.42,0.27,0.15], woodL=[0.52,0.34,0.19], woodD=[0.34,0.22,0.13];
+    for(var k=0;k<stations.length-1;k++){
+      var A=stations[k], B=stations[k+1];
+      // transform helper producing local -> world
+      function W(x,y,z){return tPoint(M,[x,y,z]);}
+      // left side (gunwale->chine)
+      q(W(-A.b,A.yg,A.s),W(-B.b,B.yg,B.s),W(-B.b*0.62,B.yc,B.s),W(-A.b*0.62,A.yc,A.s),
+        wood[0],wood[1],wood[2],i);
+      // right side
+      q(W( A.b,A.yg,A.s),W( B.b,B.yg,B.s),W( B.b*0.62,B.yc,B.s),W( A.b*0.62,A.yc,A.s),
+        woodL[0],woodL[1],woodL[2],i);
+      // bottom left
+      q(W(-A.b*0.62,A.yc,A.s),W(-B.b*0.62,B.yc,B.s),W(0,B.yk,B.s),W(0,A.yk,A.s),
+        woodD[0],woodD[1],woodD[2],i);
+      // bottom right
+      q(W( A.b*0.62,A.yc,A.s),W( B.b*0.62,B.yc,B.s),W(0,B.yk,B.s),W(0,A.yk,A.s),
+        woodD[0],woodD[1],woodD[2],i);
+      // deck (planks between gunwales, slightly lower)
+      var yd=0.22;
+      q(W(-A.b*0.86,yd,A.s),W( A.b*0.86,yd,A.s),W( B.b*0.86,yd,B.s),W(-B.b*0.86,yd,B.s),
+        0.56,0.40,0.22,i);
+    }
+    // cap the bow & stern ends
+    var F0=stations[0], L0=stations[stations.length-1];
+    function W(x,y,z){return tPoint(M,[x,y,z]);}
+    q(W(-F0.b*0.62,F0.yc,-L),W( F0.b*0.62,F0.yc,-L),W(F0.b,F0.yg,-L),W(-F0.b,F0.yg,-L),wood[0],wood[1],wood[2],i);
+    q(W(-L0.b*0.62,L0.yc, L),W( L0.b*0.62,L0.yc, L),W(L0.b,L0.yg, L),W(-L0.b,L0.yg, L),wood[0],wood[1],wood[2],i);
+    // keel outer line highlight
+    q(W(-F0.b*0.62,F0.yc,-L),W(0,F0.yk,-L),W(0,L0.yk,L),W(-L0.b*0.62,L0.yc,L), 0.18,0.11,0.06,i);
+    q(W(L0.b*0.62,L0.yc,L),W(0,L0.yk,L),W(0,F0.yk,-L),W(F0.b*0.62,F0.yc,-L), 0.18,0.11,0.06,i);
+
+    // gunwale rails
+    for(var k=0;k<stations.length-1;k++){
+      var A=stations[k],B=stations[k+1];
+      q(W(-A.b,A.yg+0.03,A.s),W(-B.b,B.yg+0.03,B.s),W(-B.b*0.95,B.yg+0.13,B.s),W(-A.b*0.95,A.yg+0.13,A.s),0.30,0.19,0.11,i);
+      q(W( A.b,A.yg+0.03,A.s),W( B.b,B.yg+0.03,B.s),W( B.b*0.95,B.yg+0.13,B.s),W( A.b*0.95,A.yg+0.13,A.s),0.30,0.19,0.11,i);
+    }
+
+    // ---- dragon prow neck + head ----
+    dragonJaw(M,i);
+
+    // ---- stern tail curl ----
+    var stx=tPoint(M,[0,1.0,3.6]);
+    box(i,0.10,0.14,0.5,0.42,0.28,0.16, stx[0],stx[1],stx[2], -0.6,0,-0.2);
+
+    // ---- mast ----
+    var mx=F0.b*0.6; // mast near midship slightly forward
+    var mastP=tPoint(M,[0,0.9,0.3]);
+    box(i,0.07,1.6,0.07,0.40,0.26,0.14, mastP[0],mastP[1],mastP[2], 0,0.04,0);
+    var mastTop=tPoint(M,[0,3.5,0.32]);
+    box(i,0.05,0.4,0.05,0.33,0.21,0.12, mastTop[0],mastTop[1],mastTop[2], 0,0.05,0.14);
+
+    // ---- yardarm ----
+    var yx=tPoint(M,[0,3.42,0.2]);
+    box(i,1.55,0.05,0.05,0.44,0.30,0.16, yx[0],yx[1],yx[2], 0,0,0);
+
+    // ---- sail (billowed striped square) ----
+    var sailZ=-0.55;
+    var nC=5,nR=9;
+    var cols=[ [0.82,0.25,0.17],[0.97,0.97,0.94] ];
+    var gx2=3.0/nC, gy2=3.0/nR;
+    var gridP=[];
+    for(var r=0;r<=nR;r++){
+      gridP.push([]);
+      var yn=r/nR;
+      for(var c=0;c<=nC;c++){
+        var xn=c/nC;
+        var x=-1.5+xn*3.0, y=0.42+yn*3.0;
+        var billow=-0.34*(1.0-0.25*Math.cos(xn*Math.PI*2)) * Math.sin(yn*Math.PI)
+                   -0.05*Math.sin(t*1.6+yn*3.1)*(1.0-yn);
+        gridP[r].push([x,y,sailZ+billow]);
+      }
+    }
+    for(var r=0;r<nR;r++){
+      for(var c=0;c<nC;c++){
+        var A=gridP[r][c],B=gridP[r][c+1],C=gridP[r+1][c+1],D=gridP[r+1][c];
+        var cA=cols[c%2], cB=cols[(c+1)%2], cC=cols[(c+1)%2], cD=cols[c%2];
+        qc(i,W(A[0],A[1],A[2]),W(B[0],B[1],B[2]),W(C[0],C[1],C[2]),W(D[0],D[1],D[2]),
+           cA,cB,cC,cD);
+      }
+    }
+    // sail seams (thin horizontal dark lines)
+    for(var r=1;r<nR;r++){
+      for(var c=0;c<nC;c++){
+        var A=gridP[r][c],B=gridP[r][c+1];
+        qc(i,W(A[0],A[1],A[2]),W(B[0],B[1],B[2]),W(B[0],B[1]-0.03,B[2]),W(A[0],A[1]-0.03,A[2]),
+          [0.3,0.2,0.15],[0.3,0.2,0.15],[0.4,0.3,0.22],[0.4,0.3,0.22]);
+      }
+    }
+
+    // ---- shields along gunwale ----
+    var shCols=[[0.62,0.18,0.16],[0.78,0.60,0.15],[0.15,0.34,0.46]];
+    var shN=6;
+    function shield(side,pos,ci){
+      var s= -L + 0.6 + (pos/(shN-1))*((L*2)-1.2);
+      var b=bAt(s);
+      var px=side*(b+0.03), py=ygAt(s)+0.18, pz=s;
+      var o=tPoint(M,[px,py,pz]);
+      var tiltX=side>0?Math.PI/2-1.15:-(Math.PI/2-1.15);
+      var oo=mmul(Rx(side>0?-0.9:0.9),Ry(0.15));
+      box(i,0.34,0.38,0.03,shCols[ci][0],shCols[ci][1],shCols[ci][2],o[0],o[1],o[2], side>0?-0.55:0.55, -0.1+0.3, 0);
+      // boss
+      var os=tPoint(M,[px,py,pz]);
+      box(i,0.06,0.06,0.02,0.50,0.40,0.22, os[0],os[1]+0.02,os[2]-(side>0?0.02:-0.02), side>0?-0.8:0.8,0,0);
+    }
+    for(var s=0;s<shN;s++){
+      shield(1,s,s%3);
+      shield(-1,s,(s+1)%3);
+    }
+
+    // ---- oars (synchronized rowing) ----
+    var cad=1.35;
+    var oarN=6;
+    for(var s=0;s<oarN;s++){
+      var st2= -L+0.7+(s/(oarN-1))*((L*2)-1.4);
+      var ph=s/oarN*Math.PI*2;
+      var ang=Math.sin(t*cad+ph);
+      var stLeg=Math.max(0.0,Math.sin(t*cad+ph));
+      var b=bAt(st2), py=ygAt(st2)-0.05, pz=st2;
+      // starboard
+      var o1=tPoint(M,[b*0.95,py,pz]);
+      var pv=ang*0.85; // fore-aft (pitch) swing
+      var dip=Math.max(0.0,-ang)*0.5; // dip into water
+      box(i,0.035,0.035,1.05,0.30,0.24,0.15,o1[0],o1[1]-dip,o1[2]-pv, 0, (ang*0.5)-0.1, 0.3);
+      // blade
+      var bd=tPoint(M,[b*1.1,py-0.9-dip,pz-pv]);
+      box(i,0.03,0.28,0.12,0.55,0.42,0.20, bd[0],bd[1],bd[2], 0,0,0.3);
+      // port
+      var o2=tPoint(M,[-b*0.95,py,pz]);
+      box(i,0.035,0.035,1.05,0.30,0.24,0.15,o2[0],o2[1]-dip,o2[2]+pv, 0, -(ang*0.5)-0.1, -0.3);
+      var bd2=tPoint(M,[-b*1.1,py-0.9-dip,pz+pv]);
+      box(i,0.03,0.28,0.12,0.55,0.42,0.20, bd2[0],bd2[1],bd2[2], 0,0,-0.3);
+    }
+
+    // return boat y for wake/camera
+    return boatY;
+  }
+
+  /* ---- wake / foam (dynamic) ---- */
+  function buildWake(A,i,shipX,shipZ,boatY,t,dt){
+    // spawn
+    var b=0.95;
+    var sternZ=shipZ+3.5;
+    var y0=boatY+0.08;
+    for(var k=0;k<2;k++){
+      var side=k?1:-1;
+      var px=shipX+side*(b+0.15)+tiny(0.3);
+      var angleW=side*0.9;
+      A.push({x:px,y:y0,z:sternZ,w:0.16+Math.random()*0.2,len:0.7,
+              vx:Math.sin(angleW)*1.1+side*(Math.random()*0.4),
+              vz:1.5+Math.random()*1.2, a:0.75, life:2.6+tiny(0.3), age:0});
+      if(A.length>360)A.splice(0,2);
+    }
+    var ax=shipX, az=shipZ;
+    for(var n=0;n<A.length;n++){
+      var p=A[n]; p.age+=dt;
+      if(p.age>=p.life){A[n]=A[A.length-1];A.pop();n--;continue;}
+      var frac=p.age/p.life;
+      p.x+=p.vx*dt*0.35;
+      p.z+=p.vz*dt;
+      p.w*= (1.0+dt*1.6);
+      p.y+=0.02*dt;
+    }
+    // build quads
+    for(var n=0;n<A.length;n++){
+      var p=A[n];
+      var frac=p.age/p.life;
+      var al=p.a*(1.0-frac); al=al*al;
+      var wy=waveY(p.x,p.z,t);
+      var wid=p.w;
+      var len=Math.max(0.2,p.len*(1.05-frac));
+      var cr=0.85, cg=0.92, cb=0.97;
+      var A0=[p.x-wid,wy,p.z-len], B0=[p.x+wid,wy,p.z-len], C0=[p.x+wid,wy,p.z+len], D0=[p.x-wid,wy,p.z+len];
+      tA(i,A0,B0,C0,cr,cg,cb,al);
+      tA(i,A0,C0,D0,cr,cg,cb,al);
+    }
+  }
+
+  /* ---------------- buffers & gl state ---------------- */
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  var VP=new Float32Array(16), PR=new Float32Array(16),
+      VW=new Float32Array(16);
+
+  function makeBuf(data){
+    var b=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,b);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.DYNAMIC_DRAW);
+    return b;
+  }
+  function drawBuf(buf,count){
+    gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+    var stride=10*4;
+    gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,stride,0);
+    gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,stride,3*4);
+    gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,stride,6*4);
+    gl.enableVertexAttribArray(3);gl.vertexAttribPointer(3,1,gl.FLOAT,false,stride,9*4);
+    gl.drawArrays(gl.TRIANGLES,0,count);
+  }
+
+  // sun / fullscreen tri
+  var sunTri=makeBuf([-1,-1, 3,-1, -1,3]);
+
+  /* ---------------- sizing ---------------- */
+  function resize(){
+    var dpr=Math.min(window.devicePixelRatio||1,2);
+    var w=window.innerWidth, h=window.innerHeight;
+    cvs.width=Math.max(1,Math.round(w*dpr));
+    cvs.height=Math.max(1,Math.round(h*dpr));
+    cvs.style.width=w+'px'; cvs.style.height=h+'px';
+    gl.viewport(0,0,cvs.width,cvs.height);
+  }
+  window.addEventListener('resize',resize);
+  resize();
+
+  /* ---------------- main loop ---------------- */
+  var skyBuf=null, waterBuf=null, shipBuf=null, wakeBuf=null, statBuf=null;
+  var last=performance.now();
+
+  function frame(now){
+    requestAnimationFrame(frame);
+    var dt=Math.min(0.05,(now-last)/1000); last=now;
+    var t=now/1000;
+    var aspect=cvs.width/cvs.height;
+
+    // ---- camera (hero side-rear tracking) ----
+    var shipX= -6+2.0*Math.sin(t*0.16);
+    var shipZ= 30 - t*2.4;
+    var camX=shipX*0.55+10+1.4*Math.sin(t*0.11);
+    var camY=8+0.7*Math.sin(t*0.5)+0.4*Math.sin(t*0.83);
+    var camZ=shipZ+15;
+    var look=[shipX+2, 3.5, shipZ+3];
+    var eye=[camX,camY,camZ];
+    lookAt(VW,eye,look,[0,1,0]);
+    persp(PR,50*Math.PI/180,aspect,0.5,1600);
+    VP=mmul(PR,VW);
+
+    // ---- sky ----
+    var sky=[]; buildSky(sky,eye);
+    if(!skyBuf)skyBuf=makeBuf(sky); else {gl.bindBuffer(gl.ARRAY_BUFFER,skyBuf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(sky),gl.DYNAMIC_DRAW);}
+
+    // ---- clear & draw ----
+    gl.clearColor(FOG[0],FOG[1],FOG[2],1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(P);
+    // fn far for sky (no fog on sky)
+    setComm(P, eye, t);
+
+    // sky (no fog)
+    gl.uniform1f(uFn,2000); gl.uniform1f(uFf,3000);
+    drawBuf(skyBuf,sky.length/10);
+
+    // ground truth: redraw fog-normal for the rest
+    gl.uniform1f(uFn,45); gl.uniform1f(uFf,560);
+
+    // static world
+    if(!statBuf)statBuf=makeBuf(STAT);
+    gl.bindBuffer(gl.ARRAY_BUFFER,statBuf);
+    drawBuf(statBuf,STAT.length/10);
+
+    // water
+    var W2=[]; buildWater(W2,t);
+    if(!waterBuf)waterBuf=makeBuf(W2); else {gl.bindBuffer(gl.ARRAY_BUFFER,waterBuf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(W2),gl.DYNAMIC_DRAW);}
+    drawBuf(waterBuf,W2.length/10);
+
+    // ship
+    var S=[]; var boatY=buildShip(S,S,shipX,shipZ,t);
+    if(!shipBuf)shipBuf=makeBuf(S); else {gl.bindBuffer(gl.ARRAY_BUFFER,shipBuf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(S),gl.DYNAMIC_DRAW);}
+    drawBuf(shipBuf,S.length/10);
+
+    // wake (additive foam)
+    var Wk=[]; buildWake(W,Wk,shipX,shipZ,boatY,t,dt);
+    if(!wakeBuf)wakeBuf=makeBuf(Wk); else {gl.bindBuffer(gl.ARRAY_BUFFER,wakeBuf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(Wk),gl.DYNAMIC_DRAW);}
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE);
+    drawBuf(wakeBuf,Wk.length/10);
+    gl.disable(gl.BLEND);
+
+    // sun glow additive on top
+    gl.depthMask(false);
+    gl.useProgram(P2);
+    var vz=VW;
+    var camR=[vz[0],vz[4],vz[8]], camUp=[vz[1],vz[5],vz[9]], camF=[vz[2],vz[6],vz[10]];
+    function lg(n){var l=Math.sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2])||1;return [n[0]/l,n[1]/l,n[2]/l];}
+    var basR=lg(camR),basU=lg(camUp),basF=lg(camF);
+    gl.uniform3fv(uR,basR); gl.uniform3fv(uU,basU); gl.uniform3fv(uB2,basF);
+    gl.uniform3f(uS,SUNX,SUNY,SUNZ);
+    gl.uniform3f(uCol,1.0,0.66,0.34);
+    gl.uniform1f(uAz,Math.tan(21*Math.PI/180)*aspect);
+    gl.uniform1f(uAy,Math.tan(21*Math.PI/180));
+    gl.uniform1f(uPow,10.0);
+    gl.uniform1f(uIv,1.6);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE);
+    gl.bindBuffer(gl.ARRAY_BUFFER,sunTri);
+    gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+    gl.disableVertexAttribArray(1);gl.disableVertexAttribArray(2);gl.disableVertexAttribArray(3);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+    gl.useProgram(P);
+  }
+  function setComm(p,eye,t){
+    gl.uniformMatrix4fv(uPV,false,VP);
+    gl.uniform3f(uL,LIGHT[0],LIGHT[1],LIGHT[2]);
+    gl.uniform3f(uE,eye[0],eye[1],eye[2]);
+    gl.uniform3f(uFogC,FOG[0],FOG[1],FOG[2]);
+  }
+
+  // kick off
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>

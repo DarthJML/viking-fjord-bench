@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Into the Fjord</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#152b32}canvas{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+<canvas id="scene" aria-label="A Viking longship sailing through a misty Norwegian fjord"></canvas>
+<script>
+(()=>{
+'use strict';
+const canvas=document.getElementById('scene'),c=canvas.getContext('2d',{alpha:false});
+let w,h,dpr,scale,ox,oy;
+function resize(){w=innerWidth;h=innerHeight;dpr=Math.min(devicePixelRatio||1,2);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);scale=Math.max(w/1600,h/900);ox=(w-1600*scale)/2;oy=(h-900*scale)/2;}
+addEventListener('resize',resize,{passive:true});resize();
+function poly(points,color){c.fillStyle=color;c.beginPath();c.moveTo(points[0][0],points[0][1]);for(let i=1;i<points.length;i++)c.lineTo(points[i][0],points[i][1]);c.closePath();c.fill()}
+function line(points,color,width=1){c.strokeStyle=color;c.lineWidth=width;c.lineCap='round';c.lineJoin='round';c.beginPath();c.moveTo(points[0][0],points[0][1]);for(let i=1;i<points.length;i++)c.lineTo(points[i][0],points[i][1]);c.stroke()}
+function grad(x,y,x2,y2,stops){let g=c.createLinearGradient(x,y,x2,y2);for(const s of stops)g.addColorStop(s[0],s[1]);return g}
+function ellipse(x,y,rx,ry,color){c.fillStyle=color;c.beginPath();c.ellipse(x,y,rx,ry,0,0,Math.PI*2);c.fill()}
+// Fixed pseudo-random marks keep the scene stable between frames.
+function rand(n){let x=Math.sin(n*127.1+311.7)*43758.5453;return x-Math.floor(x)}
+const glints=Array.from({length:180},(_,i)=>({x:rand(i+1)*1750-75,y:537+rand(i+400)*390,l:5+rand(i+800)*46,p:rand(i+1200)*6.28,a:.05+rand(i+1600)*.16}));
+const birds=Array.from({length:7},(_,i)=>({x:750+i*34+rand(i+8)*45,y:194+rand(i+10)*55,s:.5+rand(i+11)*.7}));
+function mountainBackdrop(){
+ poly([[0,525],[0,393],[186,349],[321,379],[449,317],[538,353],[646,259],[706,317],[787,215],[864,312],[928,263],[1027,352],[1134,300],[1256,360],[1400,299],[1600,345],[1600,540]],'#859c9a');
+ poly([[452,425],[646,259],[706,317],[787,215],[864,312],[928,263],[1112,424]],'#a6b5ae');
+ poly([[646,259],[706,317],[674,303],[652,315],[630,303],[602,325]],'#d7d9ca');
+ poly([[706,317],[787,215],[864,312],[831,295],[811,306],[790,276],[770,297],[750,288],[728,319]],'#e0dfcf');
+ poly([[787,215],[831,295],[811,306],[790,276],[770,297]],'#f0e9d8');
+ poly([[928,263],[1027,352],[999,335],[976,342],[950,316],[934,325],[911,309]],'#d6dace');
+ poly([[787,215],[864,312],[914,408],[829,361],[810,314]],'rgba(72,108,111,.24)');
+ poly([[0,471],[205,355],[345,431],[470,352],[585,459],[697,373],[792,475],[914,371],[1047,461],[1185,354],[1334,446],[1470,357],[1600,402],[1600,540],[0,540]],'#728f8c');
+ poly([[0,484],[197,406],[340,467],[470,402],[578,488],[717,422],[827,500],[960,419],[1112,488],[1262,401],[1412,474],[1600,416],[1600,546],[0,546]],'#5e807e');
+}
+function cliffs(t){
+ // Sheer walls frame the brighter opening and lead the eye towards the boat.
+ poly([[0,0],[201,0],[264,65],[332,113],[369,183],[420,240],[409,293],[465,354],[440,407],[487,468],[443,541],[0,579]],'#344f4c');
+ poly([[0,0],[112,0],[200,58],[218,150],[268,198],[249,268],[310,319],[294,383],[348,424],[330,519],[0,550]],'#263f3d');
+ poly([[112,0],[201,0],[264,65],[332,113],[369,183],[420,240],[409,293],[465,354],[440,407],[487,468],[443,541],[374,521],[395,454],[354,405],[371,339],[327,294],[340,225],[286,176],[273,107]],'#48645e');
+ poly([[264,65],[332,113],[369,183],[340,225],[286,176]],'#5d7770');poly([[340,225],[369,183],[420,240],[409,293],[371,339],[327,294]],'#536d65');
+ poly([[371,339],[409,293],[465,354],[440,407],[395,454],[354,405]],'#5d7569');
+ poly([[395,454],[440,407],[487,468],[443,541],[374,521]],'#708679');
+ poly([[0,224],[91,250],[129,312],[210,340],[246,414],[330,519],[0,550]],'rgba(13,38,38,.30)');
+ poly([[1600,0],[1469,0],[1401,76],[1356,146],[1322,185],[1312,249],[1268,294],[1279,355],[1232,405],[1231,479],[1180,531],[1600,569]],'#344f4c');
+ poly([[1600,0],[1513,0],[1477,97],[1430,145],[1437,231],[1392,281],[1401,359],[1354,411],[1367,508],[1600,552]],'#253e3d');
+ poly([[1469,0],[1401,76],[1356,146],[1322,185],[1312,249],[1268,294],[1279,355],[1232,405],[1231,479],[1180,531],[1261,520],[1286,462],[1330,421],[1325,355],[1365,311],[1353,243],[1403,196],[1401,132]],'#4e6961');
+ poly([[1401,76],[1356,146],[1322,185],[1353,243],[1403,196],[1401,132]],'#617b70');poly([[1312,249],[1268,294],[1279,355],[1325,355],[1365,311],[1353,243]],'#587469');poly([[1279,355],[1232,405],[1231,479],[1286,462],[1330,421],[1325,355]],'#647e70');
+ // Ledged highlights and sparse dark conifers, deliberately restrained.
+ line([[55,344],[124,364],[170,393],[219,405]],'rgba(174,183,150,.18)',2);line([[1370,340],[1422,326],[1491,338]],'rgba(174,183,150,.15)',2);
+ for(let i=0;i<32;i++){let side=i<16,x=side?rand(i+200)*325:1270+rand(i+200)*330,y=463+rand(i+300)*74,s=3+rand(i+900)*8;poly([[x-s,y],[x,y-s*3],[x+s,y]],'rgba(20,47,43,.65)')}
+}
+function water(t){
+ c.fillStyle=grad(0,510,0,900,[[0,'#78928b'],[.12,'#547c78'],[.42,'#315c5d'],[1,'#102f39']]);c.fillRect(0,518,1600,382);
+ // Reflection of the bright sky, broken into gentle, drifting horizontal flecks.
+ for(let i=0;i<glints.length;i++){let q=glints[i], depth=(q.y-510)/390,x=((q.x-t*(3+depth*12)+1800000)%1800)-100; c.strokeStyle=`rgba(218,211,176,${q.a*(.5+depth)})`;c.lineWidth=.6+depth*1.6;c.beginPath();c.moveTo(x,q.y+Math.sin(t*.6+q.p)*2);c.lineTo(x+q.l*(.3+depth),q.y+Math.sin(t*.6+q.p)*2);c.stroke()}
+ for(let j=0;j<8;j++){let y=568+j*47; c.strokeStyle='rgba(162,187,169,.055)';c.lineWidth=1+j*.18;c.beginPath();for(let x=-50;x<=1650;x+=25){let yy=y+Math.sin(x*.008+t*.6+j)*3;if(x===-50)c.moveTo(x,yy);else c.lineTo(x,yy)}c.stroke()}
+}
+function wake(t,x,y){
+ c.save();c.translate(x,y);
+ for(let i=0;i<13;i++){let z=(i/13+t*.045)%1,dx=z*460,spread=12+z*155,fade=(1-z)*.35; c.strokeStyle=`rgba(221,225,200,${fade})`;c.lineWidth=1+z*3;c.beginPath();c.moveTo(-65-dx,-2-spread*.18);c.quadraticCurveTo(-100-dx,-5-spread*.6,-110-dx,-spread);c.stroke();c.beginPath();c.moveTo(-60-dx,4+spread*.17);c.quadraticCurveTo(-100-dx,5+spread*.55,-115-dx,spread);c.stroke()}
+ c.restore();
+}
+function ship(t){
+ // A three-quarter broadside silhouette, sailing to the right.
+ let x=790+Math.sin(t*.16)*13,y=611+Math.sin(t*1.05)*5;
+ wake(t,x-60,y+45);c.save();c.translate(x,y);c.rotate(Math.sin(t*.72)*.009);
+ // Fine rigging behind the sail.
+ line([[-230,5],[-14,-297]],'#283b39',2);line([[238,-12],[-14,-297]],'#283b39',2);line([[-238,4],[-161,-232]],'#283b39',1.6);line([[235,-9],[157,-232]],'#283b39',1.6);
+ // Mast and crossbeam.
+ line([[-15,16],[-14,-315]],'#3d2d24',10);line([[-12,-310],[-12,10]],'#a77d54',3);
+ line([[-177,-247],[166,-247]],'#342a24',9);line([[-172,-250],[165,-250]],'#b99567',2);
+ // Cloth is cut into vertical stripes, with curved edges and a wind-filled belly.
+ let billow=Math.sin(t*.9)*4;
+ c.beginPath();c.moveTo(-157,-241);c.quadraticCurveTo(-174,-157,-150,-53);c.quadraticCurveTo(0,-25+billow,145,-55);c.quadraticCurveTo(170,-153,151,-241);c.closePath();c.fillStyle='#ead8b2';c.fill();
+ c.save();c.clip();
+ poly([[-160,-247],[-109,-247],[-103,-44],[-160,-44]],'#a9533d');
+ poly([[-56,-247],[-7,-247],[-4,-38],[-56,-38]],'#a9533d');
+ poly([[48,-247],[97,-247],[103,-42],[51,-42]],'#a9533d');
+ poly([[150,-247],[189,-247],[190,-43],[154,-43]],'#a9533d');
+ poly([[-160,-241],[170,-241],[153,-212],[-165,-210]],'rgba(255,244,209,.12)');
+ poly([[-160,-102],[160,-102],[152,-45],[-156,-45]],'rgba(93,63,45,.12)');
+ for(let i=0;i<15;i++){let yy=-229+i*12;line([[-160,yy],[0,yy+2+billow*.3],[160,yy]],'rgba(72,55,43,.07)',.7)}
+ c.restore();
+ c.strokeStyle='rgba(69,56,43,.5)';c.lineWidth=2;c.beginPath();c.moveTo(-157,-241);c.quadraticCurveTo(-174,-157,-150,-53);c.quadraticCurveTo(0,-25+billow,145,-55);c.quadraticCurveTo(170,-153,151,-241);c.stroke();
+ line([[-150,-53],[-206,8]],'#43372a',1.5);line([[145,-55],[217,0]],'#43372a',1.5);
+ // Far side oars.
+ for(let i=0;i<8;i++){let xx=-170+i*43,a=Math.sin(t*1.4+i*.07),endx=xx-48+a*13;line([[xx,7],[endx,-2-a*7]],'#382c22',3);line([[endx,-2-a*7],[endx-16,-4-a*7]],'#8d6945',4)}
+ // Hull, gunwale, planks and a fine gold edge.
+ poly([[-265,-8],[-231,13],[-185,23],[189,15],[234,0],[257,-23],[246,12],[221,45],[165,65],[-155,72],[-215,56],[-250,25]],'#302723');
+ poly([[-244,14],[-180,29],[180,21],[235,3],[219,42],[165,60],[-155,67],[-211,51]],'#71503a');
+ poly([[-224,34],[-166,45],[175,38],[222,25],[209,45],[164,60],[-155,67],[-204,52]],'#5b3c2d');
+ line([[-254,-6],[-221,11],[-171,18],[177,11],[224,-4],[246,-21]],'#d2a46a',4);
+ line([[-220,42],[-156,54],[169,48],[216,34]],'rgba(31,25,22,.55)',2);line([[-210,52],[-153,62],[161,57],[208,44]],'rgba(203,155,101,.3)',1);
+ // Stern tail, curled like carved timber.
+ c.strokeStyle='#4a3025';c.lineWidth=12;c.lineCap='round';c.beginPath();c.moveTo(-246,4);c.bezierCurveTo(-276,-4,-290,-36,-278,-52);c.bezierCurveTo(-268,-64,-249,-58,-253,-45);c.stroke();
+ c.strokeStyle='#c69860';c.lineWidth=2;c.beginPath();c.moveTo(-246,1);c.bezierCurveTo(-275,-8,-283,-38,-275,-49);c.stroke();
+ // Forward dragon prow: carved neck, open jaw, eye and swept horns.
+ c.strokeStyle='#463025';c.lineWidth=15;c.beginPath();c.moveTo(224,4);c.bezierCurveTo(250,-9,260,-31,260,-55);c.bezierCurveTo(261,-83,276,-98,293,-89);c.bezierCurveTo(310,-80,306,-60,294,-60);c.bezierCurveTo(283,-59,279,-69,286,-74);c.stroke();
+ c.strokeStyle='#c6965d';c.lineWidth=3;c.beginPath();c.moveTo(228,1);c.bezierCurveTo(251,-16,255,-36,255,-56);c.bezierCurveTo(256,-82,274,-98,292,-89);c.stroke();
+ poly([[283,-91],[293,-104],[293,-90],[305,-86],[313,-77],[303,-75],[295,-80]],'#614331');
+ poly([[294,-61],[309,-64],[316,-59],[305,-55],[294,-54]],'#483027');ellipse(301,-83,2,2,'#e9c58a');
+ // Round shields over the near rail.
+ const colors=['#b75e42','#d3bc83','#416b69','#c37b4e','#d2be8c','#557a73','#b85d42','#d5bd89'];
+ for(let i=0;i<8;i++){let sx=-163+i*46,sy=22-(i*1.1);ellipse(sx+1,sy+2,19,19,'rgba(17,25,22,.4)');ellipse(sx,sy,18,18,'#312c25');ellipse(sx,sy,15.5,15.5,colors[i]);c.save();c.beginPath();c.arc(sx,sy,15.5,0,Math.PI*2);c.clip();poly([[sx,sy],[sx-16,sy-16],[sx+16,sy-16]],'rgba(242,223,174,.22)');poly([[sx,sy],[sx-16,sy+16],[sx+16,sy+16]],'rgba(33,35,30,.19)');line([[sx,sy-16],[sx,sy+16]],'rgba(37,38,32,.38)',1);line([[sx-16,sy],[sx+16,sy]],'rgba(37,38,32,.38)',1);c.restore();ellipse(sx,sy,4.2,4.2,'#35352c');ellipse(sx-1,sy-1,1.3,1.3,'#d7c49b')}
+ // Near oars move together, angled down and back; blade dips through water.
+ for(let i=0;i<8;i++){let xx=-177+i*47,phase=Math.sin(t*1.4),ex=xx-43+phase*19,ey=83+Math.cos(t*1.4)*5;line([[xx,32],[ex,ey]],'#b78b58',3.5);poly([[ex,ey],[ex-8,ey+10],[ex-18,ey+13],[ex-12,ey+5]],'#805c3e');if(phase>.1)ellipse(ex-12,ey+12,9,1,'rgba(228,231,205,.35)')}
+ // Contact shadow and small foam at the bow.
+ c.restore();
+ c.strokeStyle='rgba(230,229,207,.52)';c.lineWidth=2;c.beginPath();c.moveTo(x+205,y+57);c.quadraticCurveTo(x+245,y+55,x+263,y+42);c.stroke();
+}
+function foreground(t){
+ // Atmospheric foreground ripples provide depth without obstructing the vessel.
+ let g=grad(0,750,0,900,[[0,'rgba(8,34,39,0)'],[1,'rgba(7,25,32,.46)']]);c.fillStyle=g;c.fillRect(0,750,1600,150);
+ for(let i=0;i<14;i++){let x=(rand(i+1100)*1800-t*(4+i%4)+1800000)%1800-100,y=750+rand(i+1300)*155;line([[x,y],[x+35+rand(i+1500)*75,y-1]],'rgba(188,205,181,.11)',1.5)}
+}
+function frame(ms){let t=ms*.001;c.setTransform(dpr*scale,0,0,dpr*scale,dpr*ox,dpr*oy);
+ c.fillStyle=grad(0,0,0,550,[[0,'#2c4a53'],[.38,'#718a85'],[.73,'#d1c9a7'],[1,'#b7bba4']]);c.fillRect(0,0,1600,900);
+ // Pale dawn glow behind the mountains.
+ let glow=c.createRadialGradient(839,295,20,839,295,510);glow.addColorStop(0,'rgba(255,222,165,.38)');glow.addColorStop(1,'rgba(255,222,165,0)');c.fillStyle=glow;c.fillRect(0,0,1600,600);
+ mountainBackdrop();
+ c.fillStyle=grad(0,390,0,550,[[0,'rgba(213,216,194,0)'],[.6,'rgba(208,214,193,.23)'],[1,'rgba(216,221,199,.36)']]);c.fillRect(0,370,1600,190);
+ cliffs(t);water(t);
+ for(const b of birds){let bx=b.x+Math.sin(t*.16+b.y)*12,by=b.y+Math.sin(t*.5+b.x)*2;line([[bx-6*b.s,by],[bx,by+2*b.s],[bx+6*b.s,by]],'rgba(40,62,59,.5)',1.3)}
+ ship(t);foreground(t);
+ // Subtle edge falloff pulls attention to the sail and the fjord opening.
+ let v=c.createRadialGradient(800,440,260,800,440,1030);v.addColorStop(0,'rgba(8,22,25,0)');v.addColorStop(1,'rgba(8,22,25,.35)');c.fillStyle=v;c.fillRect(0,0,1600,900);
+ requestAnimationFrame(frame)}
+ requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

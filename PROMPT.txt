@@ -1,0 +1,15 @@
+Build one self-contained HTML file: a cinematic, animated scene of a Viking longship sailing through a Norwegian fjord. Aim for the kind of single-file visual demo that makes people stop scrolling on X.
+
+Give it a stylized low-poly look, with a light voxel influence if that helps—but not chunky Minecraft blocks. The longship must be unmistakable: a long, low hull, curled dragon-head prow, round shields along the sides, a square striped sail, and oars. Surround it with steep fjord walls, distant snowy peaks, atmospheric haze, and dark moving water. Choose one strong lighting mood, such as misty dawn or golden hour.
+
+The ship must travel forward, bob gently, and leave a visible wake. Animate the water and camera smoothly; add synchronized rowing and subtle sail movement if feasible. Compose the scene with clear foreground, midground, and background depth. Prioritize a striking, art-directed result over extra features or UI.
+
+Hard requirements:
+- Exactly one .html file, with all HTML, CSS, and JavaScript inline.
+- No libraries, CDNs, external assets, fonts, or network requests. No build step.
+- It must open directly from disk via file:// in a modern browser.
+- You may use WebGL, Canvas 2D, or CSS—choose what produces the best finished scene.
+- Fill the viewport, handle resizing and high-DPI displays, and run smoothly on an ordinary laptop.
+- No menus or explanatory text over the scene.
+
+Before finishing, check that the scene immediately reads as 'Viking ship in a fjord,' that the animation has no obvious resets or flicker, and that the result looks like a finished visual piece rather than a collection of primitives. Report the exact file path and what you verified. Pick your own distinctive style; do not copy the other three models.

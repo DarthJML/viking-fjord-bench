@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Viking Fjord</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#172b35}
+  canvas{display:block;width:100%;height:100%;touch-action:none}
+  #vignette{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at 50% 43%,transparent 42%,rgba(3,10,15,.12) 70%,rgba(2,7,12,.48) 115%)}
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="An animated Viking longship sailing through a Norwegian fjord"></canvas>
+<div id="vignette"></div>
+<script>
+(() => {
+'use strict';
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', {antialias:true, alpha:false, powerPreference:'high-performance'});
+if (!gl) { document.body.style.background = 'linear-gradient(#294553,#b58e72 55%,#102d36)'; return; }
+
+const TAU = Math.PI * 2;
+const V = {
+  add:(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]],
+  sub:(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]],
+  scale:(a,s)=>[a[0]*s,a[1]*s,a[2]*s],
+  dot:(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2],
+  cross:(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],
+  norm:a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/l,a[1]/l,a[2]/l];},
+  mix:(a,b,t)=>[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t]
+};
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+const rnd=n=>{const x=Math.sin(n*127.1+311.7)*43758.5453;return x-Math.floor(x);};
+const tint=(c,s)=>[clamp(c[0]*s,0,1),clamp(c[1]*s,0,1),clamp(c[2]*s,0,1)];
+
+function m4mul(a,b){
+  const o=new Float32Array(16);
+  for(let c=0;c<4;c++) for(let r=0;r<4;r++){
+    o[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3];
+  }
+  return o;
+}
+function perspective(fov,aspect,near,far){
+  const f=1/Math.tan(fov/2), o=new Float32Array(16);
+  o[0]=f/aspect;o[5]=f;o[10]=(far+near)/(near-far);o[11]=-1;o[14]=2*far*near/(near-far);return o;
+}
+function lookAt(eye,target){
+  const z=V.norm(V.sub(eye,target)), x=V.norm(V.cross([0,1,0],z)), y=V.cross(z,x);
+  return new Float32Array([x[0],y[0],z[0],0,x[1],y[1],z[1],0,x[2],y[2],z[2],0,-V.dot(x,eye),-V.dot(y,eye),-V.dot(z,eye),1]);
+}
+function translation(x,y,z){const o=new Float32Array(16);o[0]=o[5]=o[10]=o[15]=1;o[12]=x;o[13]=y;o[14]=z;return o;}
+function rotationX(a){const c=Math.cos(a),s=Math.sin(a),o=new Float32Array(16);o[0]=1;o[5]=c;o[6]=s;o[9]=-s;o[10]=c;o[15]=1;return o;}
+function rotationY(a){const c=Math.cos(a),s=Math.sin(a),o=new Float32Array(16);o[0]=c;o[2]=-s;o[5]=1;o[8]=s;o[10]=c;o[15]=1;return o;}
+function rotationZ(a){const c=Math.cos(a),s=Math.sin(a),o=new Float32Array(16);o[0]=c;o[1]=s;o[4]=-s;o[5]=c;o[10]=1;o[15]=1;return o;}
+
+function shader(type,src){
+  const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs,fs){
+  const p=gl.createProgram();gl.attachShader(p,shader(gl.VERTEX_SHADER,vs));gl.attachShader(p,shader(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const litProgram=program(`
+attribute vec3 aPosition;
+attribute vec3 aNormal;
+attribute vec3 aColor;
+uniform mat4 uViewProj;
+uniform mat4 uModel;
+uniform float uShift;
+uniform float uTime;
+uniform float uSail;
+varying vec3 vWorld;
+varying vec3 vNormal;
+varying vec3 vColor;
+void main(){
+  vec4 w=uModel*vec4(aPosition,1.0);
+  w.z+=uShift;
+  if(uSail>0.5){
+    float xn=clamp(w.x/3.7,-1.0,1.0);
+    float v=clamp((w.y-2.65)/4.5,0.0,1.0);
+    w.z+=sin(uTime*1.35+w.x*1.1+w.y*.72)*.065*(1.0-xn*xn)*sin(3.14159265*v);
+  }
+  vWorld=w.xyz;
+  vNormal=mat3(uModel)*aNormal;
+  vColor=aColor;
+  gl_Position=uViewProj*w;
+}`,`
+precision highp float;
+uniform vec3 uCamera;
+uniform vec3 uSun;
+varying vec3 vWorld;
+varying vec3 vNormal;
+varying vec3 vColor;
+void main(){
+  vec3 n=normalize(vNormal);
+  if(!gl_FrontFacing)n=-n;
+  float diffuse=max(dot(n,uSun),0.0);
+  float hemi=.5+.5*n.y;
+  vec3 light=vec3(.29,.37,.41)*(.68+.32*hemi)+vec3(1.0,.80,.57)*diffuse*.88;
+  float rim=pow(1.0-max(dot(n,normalize(uCamera-vWorld)),0.0),3.0);
+  vec3 col=vColor*light+vec3(.12,.18,.19)*rim*.22;
+  float d=distance(uCamera,vWorld);
+  float fog=smoothstep(42.0,218.0,d);
+  fog=min(.94,fog+max(0.0,12.0-vWorld.y)*.0025);
+  col=mix(col,vec3(.55,.62,.62),fog);
+  gl_FragColor=vec4(col,1.0);
+}`);
+
+const skyProgram=program(`
+attribute vec2 aPosition;
+varying vec2 vUV;
+void main(){vUV=aPosition*.5+.5;gl_Position=vec4(aPosition,0.0,1.0);}`,`
+precision highp float;
+varying vec2 vUV;
+uniform float uTime;
+float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+void main(){
+  vec3 horizon=vec3(.67,.61,.54);
+  vec3 middle=vec3(.25,.39,.46);
+  vec3 zenith=vec3(.075,.16,.24);
+  vec3 col=mix(horizon,middle,smoothstep(.05,.50,vUV.y));
+  col=mix(col,zenith,smoothstep(.42,1.0,vUV.y));
+  vec2 sun=vec2(.18,.72);
+  float sd=distance(vUV,sun);
+  col+=vec3(1.0,.63,.32)*exp(-sd*7.5)*.28;
+  col+=vec3(1.0,.84,.57)*exp(-sd*55.0)*.34;
+  float bands=sin(vUV.x*11.0+vUV.y*25.0+sin(vUV.x*5.0)*1.4);
+  float clouds=smoothstep(.58,.94,bands)*smoothstep(.38,.62,vUV.y)*(1.0-smoothstep(.70,.91,vUV.y));
+  col=mix(col,vec3(.52,.57,.58),clouds*.10);
+  col+=(hash(gl_FragCoord.xy+uTime)-.5)/255.0;
+  gl_FragColor=vec4(col,1.0);
+}`);
+
+const waterProgram=program(`
+attribute vec3 aPosition;
+uniform mat4 uViewProj;
+uniform float uTime;
+uniform float uTravel;
+varying vec3 vWorld;
+void main(){
+  vec3 p=aPosition;
+  p.y+=sin(p.x*.55+p.z*.82+uTime*1.15)*.035+sin(p.x*1.35-p.z*.43-uTime*.9)*.022;
+  vWorld=p;
+  gl_Position=uViewProj*vec4(p,1.0);
+}`,`
+precision highp float;
+varying vec3 vWorld;
+uniform vec3 uCamera;
+uniform vec3 uSun;
+uniform float uTime;
+uniform float uTravel;
+float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float noise(vec2 p){
+  vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
+  return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);
+}
+void main(){
+  vec2 p=vWorld.xz;
+  vec2 flow=p+vec2(0.0,uTravel*.28);
+  float a=flow.x*.72+flow.y*1.08+uTime*1.28;
+  float b=flow.x*1.64-flow.y*.47-uTime*.91;
+  float c=flow.x*.29+flow.y*2.05+uTime*.63;
+  float dx=.072*cos(a)+.052*cos(b)+.018*cos(c);
+  float dz=.108*cos(a)-.015*cos(b)+.123*cos(c);
+  vec3 n=normalize(vec3(-dx,1.0,-dz));
+  vec3 view=normalize(uCamera-vWorld);
+  float fres=pow(1.0-max(dot(n,view),0.0),3.0);
+  float broad=.5+.5*sin(flow.y*.15+sin(flow.x*.12));
+  vec3 col=mix(vec3(.018,.075,.091),vec3(.055,.145,.158),broad*.38);
+  col=mix(col,vec3(.19,.29,.31),fres*.66);
+  vec3 refl=reflect(-uSun,n);
+  float rv=max(dot(refl,view),0.0);
+  float spec=pow(rv,105.0);
+  float path=pow(rv,9.0);
+  float glitter=smoothstep(.77,.97,noise(flow*vec2(3.1,6.2)+vec2(uTime*.23,-uTime*.42)));
+  col+=vec3(1.0,.82,.53)*(spec*1.65+path*glitter*.72);
+  float z=p.y;
+  float behind=smoothstep(4.5,7.0,z)*(1.0-smoothstep(29.0,43.0,z));
+  float spread=.72+max(0.0,z-4.5)*.19;
+  float arms=exp(-pow((abs(p.x)-spread)*2.45,2.0));
+  float churn=exp(-p.x*p.x*.48)*.52;
+  float foamNoise=smoothstep(.28,.79,noise(p*vec2(1.8,2.9)+vec2(0.0,-uTime*1.15)));
+  float foam=behind*(arms*.82+churn)*foamNoise;
+  float bow=(1.0-smoothstep(-7.4,-5.0,z))*smoothstep(-9.0,-7.4,z);
+  bow*=exp(-pow((abs(p.x)-1.0)*2.5,2.0))*.34;
+  col=mix(col,vec3(.57,.72,.70),clamp(foam+bow,0.0,.72));
+  float fog=smoothstep(52.0,225.0,distance(uCamera,vWorld));
+  col=mix(col,vec3(.55,.62,.62),fog);
+  gl_FragColor=vec4(col,1.0);
+}`);
+
+class Builder{
+  constructor(){this.p=[];this.n=[];this.c=[];}
+  tri(a,b,d,color){
+    const n=V.norm(V.cross(V.sub(b,a),V.sub(d,a)));
+    for(const v of [a,b,d]){this.p.push(v[0],v[1],v[2]);this.n.push(n[0],n[1],n[2]);this.c.push(color[0],color[1],color[2]);}
+  }
+  quad(a,b,c,d,color){this.tri(a,b,c,color);this.tri(a,c,d,color);}
+}
+function mesh(b){
+  const m={count:b.p.length/3};
+  m.p=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,m.p);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(b.p),gl.STATIC_DRAW);
+  m.n=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,m.n);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(b.n),gl.STATIC_DRAW);
+  m.c=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,m.c);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(b.c),gl.STATIC_DRAW);
+  return m;
+}
+function box(b,center,size,color){
+  const [x,y,z]=center,[sx,sy,sz]=size.map(v=>v/2);
+  const p=[[x-sx,y-sy,z-sz],[x+sx,y-sy,z-sz],[x+sx,y+sy,z-sz],[x-sx,y+sy,z-sz],[x-sx,y-sy,z+sz],[x+sx,y-sy,z+sz],[x+sx,y+sy,z+sz],[x-sx,y+sy,z+sz]];
+  for(const f of [[0,3,2,1],[4,5,6,7],[0,4,7,3],[1,2,6,5],[3,7,6,2],[0,1,5,4]]) b.quad(p[f[0]],p[f[1]],p[f[2]],p[f[3]],color);
+}
+function ellipsoid(b,center,radius,color,segments=8,rings=4){
+  const pt=(j,i)=>{
+    const ph=Math.PI*j/rings,th=TAU*i/segments;
+    return [center[0]+Math.sin(ph)*Math.cos(th)*radius[0],center[1]+Math.cos(ph)*radius[1],center[2]+Math.sin(ph)*Math.sin(th)*radius[2]];
+  };
+  for(let j=0;j<rings;j++)for(let i=0;i<segments;i++)b.quad(pt(j,i),pt(j+1,i),pt(j+1,i+1),pt(j,i+1),tint(color,.91+.16*rnd(i+j*19)));
+}
+function curve(points,steps){
+  const out=[];
+  for(let i=0;i<points.length-1;i++){
+    const p0=points[Math.max(0,i-1)],p1=points[i],p2=points[i+1],p3=points[Math.min(points.length-1,i+2)];
+    for(let j=0;j<steps;j++){
+      const t=j/steps,t2=t*t,t3=t2*t;
+      out.push([0,1,2].map(k=>.5*((2*p1[k])+(-p0[k]+p2[k])*t+(2*p0[k]-5*p1[k]+4*p2[k]-p3[k])*t2+(-p0[k]+3*p1[k]-3*p2[k]+p3[k])*t3)));
+    }
+  }
+  out.push(points[points.length-1]);return out;
+}
+function tube(b,points,r0,r1,sides,color,smooth=true){
+  const pts=smooth?curve(points,4):points, rings=[];
+  for(let i=0;i<pts.length;i++){
+    const t=i/(pts.length-1),tan=V.norm(V.sub(pts[Math.min(i+1,pts.length-1)],pts[Math.max(0,i-1)]));
+    const ref=Math.abs(V.dot(tan,[1,0,0]))>.9?[0,1,0]:[1,0,0];
+    const u=V.norm(V.cross(tan,ref)),v=V.norm(V.cross(tan,u)),r=r0+(r1-r0)*t,ring=[];
+    for(let j=0;j<sides;j++){const a=TAU*j/sides;ring.push(V.add(pts[i],V.add(V.scale(u,Math.cos(a)*r),V.scale(v,Math.sin(a)*r))));}
+    rings.push(ring);
+  }
+  for(let i=0;i<rings.length-1;i++)for(let j=0;j<sides;j++)b.quad(rings[i][j],rings[i+1][j],rings[i+1][(j+1)%sides],rings[i][(j+1)%sides],tint(color,.9+.17*rnd(i*13+j)));
+  for(let j=1;j<sides-1;j++){b.tri(pts[0],rings[0][j+1],rings[0][j],color);b.tri(pts[pts.length-1],rings[rings.length-1][j],rings[rings.length-1][j+1],color);}
+}
+
+const ship=new Builder();
+const hullColors=[[.30,.135,.073],[.36,.165,.082],[.25,.105,.058],[.41,.205,.105]];
+function widthAt(z){return .16+1.53*Math.pow(Math.max(0,1-(z/7.65)*(z/7.65)),.56);}
+const stations=[];
+for(let i=0;i<=16;i++){
+  const z=-7.4+i*14.8/16,e=Math.abs(z)/7.4,w=widthAt(z),top=1.10+.79*e*e*e,bottom=.08+.34*e*e;
+  const cross=[[-w,top],[-w*.97,top-.34],[-w*.72,.43+.16*e], [0,bottom], [w*.72,.43+.16*e], [w*.97,top-.34], [w,top]];
+  stations.push({z,w,top,cross});
+}
+for(let i=0;i<stations.length-1;i++)for(let j=0;j<6;j++){
+  const a=stations[i],d=stations[i+1],col=tint(hullColors[j%4],.91+.13*rnd(i*7+j));
+  ship.quad([a.cross[j][0],a.cross[j][1],a.z],[d.cross[j][0],d.cross[j][1],d.z],[d.cross[j+1][0],d.cross[j+1][1],d.z],[a.cross[j+1][0],a.cross[j+1][1],a.z],col);
+}
+for(let i=0;i<stations.length-1;i++){
+  const a=stations[i],d=stations[i+1],ay=.64+.16*Math.pow(Math.abs(a.z)/7.4,2),dy=.64+.16*Math.pow(Math.abs(d.z)/7.4,2);
+  ship.quad([-a.w*.87,ay,a.z],[-d.w*.87,dy,d.z],[d.w*.87,dy,d.z],[a.w*.87,ay,a.z],tint([.39,.25,.135],.9+.18*rnd(i+90)));
+}
+for(const side of [-1,1]){
+  tube(ship,stations.map(s=>[side*s.w,s.top,s.z]),.095,.095,6,[.48,.28,.115],false);
+  for(const level of [1,2])tube(ship,stations.map(s=>{const q=s.cross[level];return [side*Math.abs(q[0]),q[1],s.z];}),.026,.026,5,[.16,.075,.04],false);
+}
+for(const z of [-5.8,-3.0,3.0,5.8]){
+  const w=widthAt(z)*.84;box(ship,[0,.94,z],[w*2,.12,.28],[.32,.19,.09]);
+}
+
+function addShield(side,z,index){
+  const colors=[[.55,.12,.085],[.67,.43,.14],[.12,.32,.34],[.72,.63,.43]];
+  const base=colors[index%colors.length],w=widthAt(z),x=side*(w+.16),y=1.25+.16*Math.pow(Math.abs(z)/7.4,2),r=.59,N=16;
+  const point=(a,rr,xx)=>[xx,y+Math.cos(a)*rr,z+Math.sin(a)*rr];
+  for(let i=0;i<N;i++){
+    const a=TAU*i/N,d=TAU*(i+1)/N,c=tint(base,.88+.18*rnd(index*31+i));
+    if(side>0){ship.tri([x,y,z],point(a,r*.86,x),point(d,r*.86,x),c);ship.quad(point(a,r*.86,x),point(d,r*.86,x),point(d,r,x),point(a,r,x),[.26,.25,.22]);}
+    else{ship.tri([x,y,z],point(d,r*.86,x),point(a,r*.86,x),c);ship.quad(point(d,r*.86,x),point(a,r*.86,x),point(a,r,x),point(d,r,x),[.26,.25,.22]);}
+  }
+  ellipsoid(ship,[x+side*.075,y,z],[.14,.18,.18],[.38,.35,.27],8,4);
+}
+for(const side of [-1,1])for(let i=0;i<9;i++)addShield(side,-5.6+i*1.4,i+(side<0?2:0));
+
+// Curled dragon prow and rising spiral stern.
+tube(ship,[[0,1.35,-6.9],[0,2.05,-7.65],[0,3.02,-7.92],[0,3.93,-7.58],[0,4.42,-7.12]],.27,.22,7,[.29,.125,.058]);
+ellipsoid(ship,[0,4.40,-7.35],[.34,.32,.58],[.34,.15,.063],8,4);
+box(ship,[0,4.30,-7.87],[.42,.28,.68],[.38,.17,.07]);
+for(const side of [-1,1]){
+  tube(ship,[[side*.20,4.55,-7.10],[side*.29,4.94,-6.91],[side*.22,5.18,-6.72]],.075,.012,5,[.20,.085,.038]);
+  ellipsoid(ship,[side*.31,4.49,-7.55],[.045,.065,.07],[1.0,.61,.16],6,3);
+}
+tube(ship,[[0,1.35,6.9],[0,2.15,7.70],[0,3.10,7.62],[0,3.80,7.02],[0,3.94,6.28],[0,3.61,5.77],[0,3.12,5.96],[0,3.12,6.42]],.25,.075,7,[.30,.13,.06]);
+// Mast, yard and rigging.
+tube(ship,[[0,.62,0],[0,8.35,0]],.14,.085,8,[.28,.16,.078],false);
+tube(ship,[[-4.18,7.27,.08],[4.18,7.27,.08]],.09,.09,7,[.30,.17,.08],false);
+const rope=[.19,.16,.11];
+for(const end of [[0,1.65,-7.0],[0,1.65,7.0],[-1.25,1.12,-3.7],[1.25,1.12,-3.7],[-1.25,1.12,3.7],[1.25,1.12,3.7]])tube(ship,[[0,8.12,0],end],.018,.018,4,rope,false);
+for(const side of [-1,1])tube(ship,[[side*4.12,7.27,.08],[side*3.55,2.69,.10],[side*1.30,1.1,2.7]],.018,.018,4,rope,false);
+const shipMesh=mesh(ship);
+
+const sailBuilder=new Builder();
+const NX=12,NY=8;
+function sailPoint(i,j){
+  const xn=-1+2*i/NX,v=j/NY,x=xn*3.7,y=2.65+v*4.5;
+  const z=.12+.64*(1-xn*xn)*Math.sin(Math.PI*v);
+  return [x,y,z];
+}
+for(let i=0;i<NX;i++)for(let j=0;j<NY;j++){
+  const color=(Math.floor(i/2)%2===0)?[.76,.68,.50]:[.53,.105,.073];
+  sailBuilder.quad(sailPoint(i,j),sailPoint(i+1,j),sailPoint(i+1,j+1),sailPoint(i,j+1),tint(color,.96+.05*rnd(i*9+j)));
+}
+const sailMesh=mesh(sailBuilder);
+const sailEdges=new Builder();
+for(const i of [0,NX])tube(sailEdges,Array.from({length:NY+1},(_,j)=>sailPoint(i,j)),.025,.025,5,[.30,.22,.13],false);
+for(const j of [0,NY])tube(sailEdges,Array.from({length:NX+1},(_,i)=>sailPoint(i,j)),.025,.025,5,[.30,.22,.13],false);
+const sailEdgeMesh=mesh(sailEdges);
+
+const oarBuilder=new Builder();
+box(oarBuilder,[1.65,0,0],[3.3,.065,.065],[.40,.24,.105]);
+box(oarBuilder,[3.48,0,0],[.82,.105,.34],[.46,.28,.12]);
+box(oarBuilder,[3.91,0,0],[.16,.09,.25],[.46,.28,.12]);
+const oarMesh=mesh(oarBuilder);
+const oarZ=[-4.9,-3.5,-2.1,-.7,.7,2.1,3.5,4.9];
+
+const cliffs=new Builder();
+const rock=[.25,.31,.30],moss=[.19,.28,.25];
+for(const side of [-1,1]){
+  const rows=[];
+  for(let i=0;i<=60;i++){
+    const z=-360+i*8,k=i%15,phase=side<0?1.7:0;
+    const inner=14.2+2.6*Math.sin(TAU*k/15+phase)+1.25*Math.sin(TAU*k*2/15+.7+phase);
+    const h=20.5+5.8*Math.sin(TAU*k/15+1.1+phase)+2.5*Math.cos(TAU*k*3/15+phase);
+    const pts=[[side*(inner-1.1),-1.0,z],[side*inner,2.1,z],[side*(inner+2.1),h*.36,z],[side*(inner+5.8),h*.70,z],[side*(inner+11.5),h,z],[side*(inner+23),h+3.5,z]];
+    rows.push(pts);
+  }
+  for(let i=0;i<60;i++)for(let j=0;j<5;j++){
+    const base=j===4&&((i+(side<0?3:0))%15>9)?[.47,.51,.47]:(j>2?V.mix(rock,moss,.38):rock);
+    const c=tint(base,.72+.43*rnd(i*17+j*3+(side<0?700:0)));
+    if((i+j)%2){cliffs.tri(rows[i][j],rows[i+1][j],rows[i][j+1],c);cliffs.tri(rows[i+1][j],rows[i+1][j+1],rows[i][j+1],tint(c,.93));}
+    else cliffs.quad(rows[i][j],rows[i+1][j],rows[i+1][j+1],rows[i][j+1],c);
+  }
+}
+const cliffMesh=mesh(cliffs);
+
+const mountains=new Builder();
+function mountain(cx,cz,r,h,baseY,seed){
+  const N=9,base=[],mid=[],apex=[cx+r*.08,baseY+h,cz-r*.05];
+  for(let i=0;i<N;i++){
+    const a=TAU*i/N,rr=r*(.82+.28*rnd(seed+i));
+    base.push([cx+Math.cos(a)*rr,baseY,cz+Math.sin(a)*rr]);
+    mid.push([cx+Math.cos(a)*rr*.43,baseY+h*(.57+.07*rnd(seed+i+20)),cz+Math.sin(a)*rr*.43]);
+  }
+  for(let i=0;i<N;i++){
+    const j=(i+1)%N,rc=tint([.30,.36,.37],.78+.32*rnd(seed+i+40));
+    mountains.quad(base[i],base[j],mid[j],mid[i],rc);
+    const snow=tint([.82,.85,.81],.86+.18*rnd(seed+i+60));
+    mountains.tri(mid[i],mid[j],apex,snow);
+  }
+}
+mountain(-45,-188,34,53,2,10);
+mountain(4,-232,48,68,0,40);
+mountain(47,-202,33,55,3,70);
+mountain(-79,-172,29,45,5,100);
+mountain(82,-184,31,49,4,130);
+const mountainMesh=mesh(mountains);
+
+const waterPositions=[],waterIndices=[];
+const WX=64,WZ=80;
+for(let j=0;j<=WZ;j++)for(let i=0;i<=WX;i++)waterPositions.push(-140+280*i/WX,0,-270+380*j/WZ);
+for(let j=0;j<WZ;j++)for(let i=0;i<WX;i++){
+  const a=j*(WX+1)+i,b=a+1,c=a+WX+1,d=c+1;waterIndices.push(a,c,b,b,c,d);
+}
+const waterP=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,waterP);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(waterPositions),gl.STATIC_DRAW);
+const waterI=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,waterI);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(waterIndices),gl.STATIC_DRAW);
+const skyB=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,skyB);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+
+const LU={};
+for(const n of ['uViewProj','uModel','uShift','uTime','uSail','uCamera','uSun'])LU[n]=gl.getUniformLocation(litProgram,n);
+const LA={p:gl.getAttribLocation(litProgram,'aPosition'),n:gl.getAttribLocation(litProgram,'aNormal'),c:gl.getAttribLocation(litProgram,'aColor')};
+const WU={};for(const n of ['uViewProj','uTime','uTravel','uCamera','uSun'])WU[n]=gl.getUniformLocation(waterProgram,n);
+const SU={time:gl.getUniformLocation(skyProgram,'uTime')};
+const identity=translation(0,0,0),sun=V.norm([-.64,.78,.46]);
+
+function bindAttribute(buffer,location,size){
+  gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.enableVertexAttribArray(location);gl.vertexAttribPointer(location,size,gl.FLOAT,false,0,0);
+}
+function drawMesh(m,model,shift,time,isSail=0){
+  bindAttribute(m.p,LA.p,3);bindAttribute(m.n,LA.n,3);bindAttribute(m.c,LA.c,3);
+  gl.uniformMatrix4fv(LU.uModel,false,model);gl.uniform1f(LU.uShift,shift);gl.uniform1f(LU.uTime,time);gl.uniform1f(LU.uSail,isSail);
+  gl.drawArrays(gl.TRIANGLES,0,m.count);
+}
+
+let width=0,height=0;
+function resize(){
+  const dpr=Math.min(window.devicePixelRatio||1,1.8),w=Math.round(innerWidth*dpr),h=Math.round(innerHeight*dpr);
+  if(w!==width||h!==height){width=canvas.width=w;height=canvas.height=h;gl.viewport(0,0,w,h);}
+}
+window.addEventListener('resize',resize,{passive:true});
+gl.enable(gl.DEPTH_TEST);gl.disable(gl.CULL_FACE);gl.clearColor(.1,.2,.25,1);
+
+function frame(ms){
+  const t=ms*.001,travel=t*1.65,shift=travel%120,aspect=width/Math.max(1,height);
+  resize();
+  const portrait=aspect<1,scale=aspect<.72?1.28:(portrait?1.12:1);
+  const side=portrait?7.7:10.8;
+  const eye=[(side+Math.sin(t*.055)*.65)*scale,6.35+Math.sin(t*.083)*.18,17.7*scale+Math.sin(t*.047)*.55];
+  const target=[0,2.35,-1.75];
+  const fov=(portrait?61:47)*Math.PI/180;
+  const vp=m4mul(perspective(fov,aspect,.15,480),lookAt(eye,target));
+
+  gl.disable(gl.DEPTH_TEST);gl.depthMask(false);gl.useProgram(skyProgram);
+  bindAttribute(skyB,gl.getAttribLocation(skyProgram,'aPosition'),2);gl.uniform1f(SU.time,t);gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.depthMask(true);gl.clear(gl.DEPTH_BUFFER_BIT);gl.enable(gl.DEPTH_TEST);
+
+  gl.useProgram(waterProgram);bindAttribute(waterP,gl.getAttribLocation(waterProgram,'aPosition'),3);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,waterI);
+  gl.uniformMatrix4fv(WU.uViewProj,false,vp);gl.uniform1f(WU.uTime,t);gl.uniform1f(WU.uTravel,travel);
+  gl.uniform3fv(WU.uCamera,eye);gl.uniform3fv(WU.uSun,sun);gl.drawElements(gl.TRIANGLES,waterIndices.length,gl.UNSIGNED_SHORT,0);
+
+  gl.useProgram(litProgram);gl.uniformMatrix4fv(LU.uViewProj,false,vp);gl.uniform3fv(LU.uCamera,eye);gl.uniform3fv(LU.uSun,sun);
+  drawMesh(mountainMesh,identity,0,t);
+  drawMesh(cliffMesh,identity,shift,t);
+
+  const bob=.095*Math.sin(t*.83)+.025*Math.sin(t*1.71);
+  const shipModel=m4mul(translation(0,bob,0),m4mul(rotationZ(.018*Math.sin(t*.67)),rotationX(.012*Math.sin(t*.79+.8))));
+  drawMesh(shipMesh,shipModel,0,t);
+  drawMesh(sailMesh,shipModel,0,t,1);
+  drawMesh(sailEdgeMesh,shipModel,0,t);
+
+  const phase=t*1.22;
+  for(const sideSign of [-1,1])for(let i=0;i<oarZ.length;i++){
+    const z=oarZ[i],x=sideSign*widthAt(z)*.87;
+    const sweep=.15*Math.cos(phase+i*.045),dip=-.20+.25*Math.sin(phase+i*.045);
+    let local=m4mul(translation(x,1.00,z),rotationY(sideSign>0?sweep:Math.PI-sweep));
+    local=m4mul(local,rotationZ(dip));
+    drawMesh(oarMesh,m4mul(shipModel,local),0,t);
+  }
+  requestAnimationFrame(frame);
+}
+resize();requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

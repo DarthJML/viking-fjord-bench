@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fjord</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0b1418;overflow:hidden}
+  #scene{display:block;width:100vw;height:100vh}
+  .vignette{position:fixed;inset:0;pointer-events:none;
+    background:
+      radial-gradient(120% 95% at 55% 45%, rgba(0,0,0,0) 45%, rgba(4,10,14,0.42) 100%),
+      linear-gradient(to bottom, rgba(6,12,18,0.18), rgba(0,0,0,0) 22%, rgba(0,0,0,0) 82%, rgba(3,8,12,0.30));
+    mix-blend-mode:multiply}
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div class="vignette"></div>
+<script>
+(function(){
+'use strict';
+
+var canvas = document.getElementById('scene');
+var gl = canvas.getContext('webgl2', {antialias:true, alpha:false, depth:true, powerPreference:'high-performance'});
+if(!gl){ document.body.style.background='linear-gradient(#26333c,#0d171c)'; return; }
+
+/* ---------------- math ---------------- */
+function ident(){ var m=new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; return m; }
+function mul(a,b){
+  var o=new Float32Array(16);
+  for(var c=0;c<4;c++)for(var r=0;r<4;r++){
+    o[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3];
+  }
+  return o;
+}
+function trans(x,y,z){ var m=ident(); m[12]=x;m[13]=y;m[14]=z; return m; }
+function rotY(a){ var c=Math.cos(a),s=Math.sin(a),m=ident(); m[0]=c;m[2]=-s;m[8]=s;m[10]=c; return m; }
+function rotX(a){ var c=Math.cos(a),s=Math.sin(a),m=ident(); m[5]=c;m[6]=s;m[9]=-s;m[10]=c; return m; }
+function rotZ(a){ var c=Math.cos(a),s=Math.sin(a),m=ident(); m[0]=c;m[1]=s;m[4]=-s;m[5]=c; return m; }
+function scl(x,y,z){ var m=ident(); m[0]=x;m[5]=y;m[10]=z; return m; }
+function persp(fovy,aspect,near,far){
+  var f=1/Math.tan(fovy/2), nf=1/(near-far), m=new Float32Array(16);
+  m[0]=f/aspect; m[5]=f; m[10]=(far+near)*nf; m[11]=-1; m[14]=2*far*near*nf;
+  return m;
+}
+function lookAt(eye,center,up){
+  var zx=eye[0]-center[0], zy=eye[1]-center[1], zz=eye[2]-center[2];
+  var zl=Math.hypot(zx,zy,zz)||1; zx/=zl; zy/=zl; zz/=zl;
+  var xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+  var xl=Math.hypot(xx,xy,xz)||1; xx/=xl; xy/=xl; xz/=xl;
+  var yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  var m=new Float32Array(16);
+  m[0]=xx;m[1]=yx;m[2]=zx;m[3]=0;
+  m[4]=xy;m[5]=yy;m[6]=zy;m[7]=0;
+  m[8]=xz;m[9]=yz;m[10]=zz;m[11]=0;
+  m[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+  m[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+  m[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+  m[15]=1;
+  return m;
+}
+function norm(v){ var l=Math.hypot(v[0],v[1],v[2])||1; return [v[0]/l,v[1]/l,v[2]/l]; }
+function cross(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function sub(a,b){ return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]; }
+function add(a,b){ return [a[0]+b[0],a[1]+b[1],a[2]+b[2]]; }
+function sc(a,s){ return [a[0]*s,a[1]*s,a[2]*s]; }
+
+/* ---------------- noise ---------------- */
+function fract(x){ return x-Math.floor(x); }
+function h2(x,y){ return fract(Math.sin(x*127.1+y*311.7)*43758.5453123); }
+function vn(x,y){
+  var xi=Math.floor(x), yi=Math.floor(y), xf=x-xi, yf=y-yi;
+  var u=xf*xf*(3-2*xf), v=yf*yf*(3-2*yf);
+  var a=h2(xi,yi), b=h2(xi+1,yi), c=h2(xi,yi+1), d=h2(xi+1,yi+1);
+  return (a*(1-u)+b*u)*(1-v)+(c*(1-u)+d*u)*v;
+}
+function fbm(x,y){
+  return vn(x,y)*0.55 + vn(x*2.13+5.2,y*2.13-3.1)*0.28 + vn(x*4.37-2.4,y*4.37+7.7)*0.17;
+}
+var rs=987654321;
+function rnd(){ rs=(rs*1664525+1013904223)>>>0; return rs/4294967296; }
+
+/* ---------------- mesh ---------------- */
+function M(){ return {p:[],n:[],c:[],u:[]}; }
+function tri(m,a,b,c,col){
+  var u=[b[0]-a[0],b[1]-a[1],b[2]-a[2]], v=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
+  var nn=[u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]];
+  var l=Math.hypot(nn[0],nn[1],nn[2])||1; nn[0]/=l; nn[1]/=l; nn[2]/=l;
+  var pts=[a,b,c];
+  for(var k=0;k<3;k++){
+    m.p.push(pts[k][0],pts[k][1],pts[k][2]);
+    m.n.push(nn[0],nn[1],nn[2]);
+    m.c.push(col[0],col[1],col[2]);
+    m.u.push(0,0);
+  }
+}
+function triUV(m,a,b,c,col,ua,ub,uc){
+  var u=[b[0]-a[0],b[1]-a[1],b[2]-a[2]], v=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
+  var nn=[u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]];
+  var l=Math.hypot(nn[0],nn[1],nn[2])||1; nn[0]/=l; nn[1]/=l; nn[2]/=l;
+  var pts=[a,b,c], uvs=[ua,ub,uc];
+  for(var k=0;k<3;k++){
+    m.p.push(pts[k][0],pts[k][1],pts[k][2]);
+    m.n.push(nn[0],nn[1],nn[2]);
+    m.c.push(col[0],col[1],col[2]);
+    m.u.push(uvs[k][0],uvs[k][1]);
+  }
+}
+function quad(m,a,b,c,d,col){ tri(m,a,b,c,col); tri(m,a,c,d,col); }
+function vary(col,s,k){
+  var r=h2(s*3.7+1.3,k*9.1+4.4);
+  var f=0.88+0.24*r;
+  return [Math.min(1,col[0]*f),Math.min(1,col[1]*f),Math.min(1,col[2]*f)];
+}
+
+/* ---------------- colours ---------------- */
+var C = {
+  hullDark:[0.150,0.093,0.070],
+  hullMid:[0.200,0.120,0.082],
+  hullRail:[0.380,0.180,0.105],
+  hullTrim:[0.560,0.330,0.150],
+  deck:[0.225,0.145,0.098],
+  wood:[0.300,0.190,0.115],
+  dragon:[0.170,0.105,0.080],
+  dragonLit:[0.330,0.190,0.110],
+  gold:[0.780,0.520,0.190],
+  iron:[0.090,0.100,0.110],
+  shieldRed:[0.480,0.130,0.110],
+  shieldCream:[0.760,0.690,0.520],
+  shieldOchre:[0.600,0.380,0.130],
+  sailCream:[0.830,0.770,0.620],
+  sailRed:[0.470,0.150,0.130],
+  sailTrim:[0.330,0.120,0.100],
+  tree:[0.085,0.135,0.105]
+};
+
+/* ---------------- terrain ---------------- */
+function centerX(z){ return 16*Math.sin(z*0.0024) + 8*Math.sin(z*0.0009+1.1); }
+function shoreW(z){
+  var pinch = 13*Math.exp(-Math.pow((z-980)/420,2));
+  return 64 + 11*Math.sin(z*0.0031+0.7) + 6*Math.sin(z*0.0017+2.4) - pinch;
+}
+function ridgeH(z){
+  var h = 96 + 52*Math.sin(z*0.0016+0.6) + 34*Math.sin(z*0.0007-1.3) + 34*(fbm(z*0.004,7.7)-0.5);
+  return Math.max(48,h);
+}
+function terrainPt(side,z,u){
+  var cx=centerX(z), sw=shoreW(z);
+  var x = cx + side*(sw + u*330);
+  var prof = Math.pow(u,0.72);
+  var y = -7 + prof*ridgeH(z);
+  y += (fbm(x*0.021,z*0.021)-0.5)*(7+58*u);
+  y += Math.sin(u*8.5+z*0.018)*7.5*u;
+  y += (fbm(x*0.08+11,z*0.08-4)-0.5)*10*u;
+  x += (fbm(x*0.03,z*0.03)-0.5)*16*u;
+  z += (fbm(x*0.03+31,z*0.03+9)-0.5)*10*u;
+  return [x,y,z];
+}
+function buildTerrain(){
+  var m=M();
+  var z0=-420, z1=2500, nz=210, nu=24;
+  for(var s=-1;s<=1;s+=2){
+    var grid=[];
+    for(var i=0;i<=nz;i++){
+      var row=[];
+      var z=z0+(z1-z0)*i/nz;
+      for(var j=0;j<=nu;j++) row.push(terrainPt(s,z,j/nu));
+      grid.push(row);
+    }
+    for(var i2=0;i2<nz;i2++){
+      for(var j2=0;j2<nu;j2++){
+        var a=grid[i2][j2], b=grid[i2][j2+1], c=grid[i2+1][j2+1], d=grid[i2+1][j2];
+        var zn=(a[2]+c[2])*0.5;
+        var yavg=(a[1]+b[1]+c[1]+d[1])*0.25;
+        var snowLine=100+30*Math.sin(zn*0.0041+1.1)+22*(fbm(zn*0.01,3.3)-0.5);
+        var col;
+        if(yavg>snowLine) col=[0.800,0.830,0.870];
+        else if(yavg>snowLine-38 && fbm(zn*0.03,1.1)>0.55) col=[0.520,0.535,0.560];
+        else if(yavg<10) col=[0.140,0.165,0.150];
+        else {
+          var strata=0.5+0.5*Math.sin(yavg*0.33+zn*0.02);
+          var v=0.72+0.5*strata;
+          col=[0.205*v,0.205*v,0.235*v];
+        }
+        var f1=0.80+0.36*h2(i2*2.3+7.1,j2*1.7+3.3+s);
+        var f2=0.80+0.36*h2(i2*1.3+2.1,j2*2.9+8.7+s);
+        var ca=[Math.min(1,col[0]*f1),Math.min(1,col[1]*f1),Math.min(1,col[2]*f1)];
+        var cb=[Math.min(1,col[0]*f2),Math.min(1,col[1]*f2),Math.min(1,col[2]*f2)];
+        tri(m,a,b,c,ca); tri(m,a,c,d,cb);
+      }
+    }
+  }
+  // conifers on lower slopes
+  for(var t=0;t<150;t++){
+    var side = (t%2===0)?1:-1;
+    var zz = -260 + rnd()*900;
+    var uu = 0.010 + Math.pow(rnd(),1.6)*0.10;
+    var pt = terrainPt(side,zz,uu);
+    if(pt[1] < 2 || pt[1] > 62) continue;
+    var hgt = 3.2 + rnd()*3.4;
+    var rad = 0.9 + hgt*0.20;
+    var base=[pt[0],pt[1]-1.2,pt[2]];
+    for(var tier=0;tier<3;tier++){
+      var yb=base[1]+tier*hgt*0.30;
+      var yr=rad*(1-tier*0.26);
+      var yt=yb+hgt*0.62;
+      var sides=5;
+      for(var k=0;k<sides;k++){
+        var a0=k/sides*Math.PI*2, a1=(k+1)/sides*Math.PI*2;
+        var p0=[base[0]+Math.cos(a0)*yr, yb, base[2]+Math.sin(a0)*yr];
+        var p1=[base[0]+Math.cos(a1)*yr, yb, base[2]+Math.sin(a1)*yr];
+        var apex=[base[0], yt, base[2]];
+        tri(m,p0,p1,apex,vary(C.tree,t*3+tier,k));
+      }
+    }
+  }
+  return m;
+}
+
+/* ---------------- ship ---------------- */
+function tube(m,path,radii,sides,col,shadeSeed){
+  for(var i=0;i<path.length-1;i++){
+    var p0=path[i], p1=path[i+1];
+    var tan=norm(sub(p1,p0));
+    var ref = Math.abs(tan[1])>0.9 ? [0,0,1] : [0,1,0];
+    var uu=norm(cross(ref,tan)), vv=cross(tan,uu);
+    for(var s=0;s<sides;s++){
+      var a0=s/sides*Math.PI*2, a1=(s+1)/sides*Math.PI*2;
+      var q0=add(p0,add(sc(uu,Math.cos(a0)*radii[i]),sc(vv,Math.sin(a0)*radii[i])));
+      var q1=add(p0,add(sc(uu,Math.cos(a1)*radii[i]),sc(vv,Math.sin(a1)*radii[i])));
+      var q2=add(p1,add(sc(uu,Math.cos(a1)*radii[i+1]),sc(vv,Math.sin(a1)*radii[i+1])));
+      var q3=add(p1,add(sc(uu,Math.cos(a0)*radii[i+1]),sc(vv,Math.sin(a0)*radii[i+1])));
+      quad(m,q0,q1,q2,q3,vary(col,shadeSeed+i,s));
+    }
+  }
+}
+
+function buildShip(){
+  var m=M();
+  var NS=22, NK=10, L=34;
+  var st=[], rings=[];
+  for(var i=0;i<=NS;i++){
+    var t=i/NS, z=-L/2+L*t;
+    var beam=4.75*Math.pow(Math.sin(Math.PI*(0.030+0.94*t)),0.62);
+    var keel=-1.55 + 2.35*Math.pow(Math.max(0,t-0.66)/0.34,2.0) + 0.85*Math.pow(Math.max(0,0.30-t)/0.30,2.2);
+    var rail=1.75 + 3.05*Math.pow(t,2.4) + 0.66*Math.pow(1-t,2.6);
+    st.push({t:t,z:z,beam:beam,keel:keel,rail:rail});
+    var ring=[];
+    for(var k=0;k<=NK;k++){
+      var th=-Math.PI/2+Math.PI*k/NK;
+      var x=beam*Math.sin(th)*(1.0+0.07*Math.cos(th*2.0));
+      var y=rail-(rail-keel)*Math.pow(Math.max(0,Math.cos(th)),0.88);
+      ring.push([x,y,z]);
+    }
+    rings.push(ring);
+  }
+  for(var i2=0;i2<NS;i2++){
+    for(var k2=0;k2<NK;k2++){
+      var a=rings[i2][k2], b=rings[i2][k2+1], c=rings[i2+1][k2+1], d=rings[i2+1][k2];
+      var col;
+      if(k2===0||k2===NK-1) col=C.hullRail;
+      else if(k2===1||k2===NK-2) col=C.hullTrim;
+      else if(k2>=NK-4) col=C.hullMid;
+      else col=C.hullDark;
+      quad(m,a,b,c,d,vary(col,i2*5+1,k2));
+    }
+  }
+  // deck
+  for(var i3=0;i3<NS-3;i3++){
+    var s0=st[i3], s1=st[i3+1];
+    var w0=s0.beam*1.35, w1=s1.beam*1.35;
+    var y0=s0.rail-0.62, y1=s1.rail-0.62;
+    var dc=(i3%2===0)?C.deck:[0.19,0.125,0.085];
+    quad(m,[-w0,y0,s0.z],[w0,y0,s0.z],[w1,y1,s1.z],[-w1,y1,s1.z],vary(dc,i3,3));
+  }
+  // keel strip
+  for(var i4=0;i4<NS;i4++){
+    var s0b=st[i4], s1b=st[i4+1];
+    quad(m,[0,s0b.keel-0.10,s0b.z-0.2],[0.16,s0b.keel-0.02,s0b.z-0.2],
+          [0.16,s1b.keel-0.02,s1b.z+0.2],[0,s1b.keel-0.10,s1b.z+0.2],vary(C.hullDark,i4,7));
+    quad(m,[0,s0b.keel-0.10,s0b.z-0.2],[-0.16,s0b.keel-0.02,s0b.z-0.2],
+          [-0.16,s1b.keel-0.02,s1b.z+0.2],[0,s1b.keel-0.10,s1b.z+0.2],vary(C.hullDark,i4,9));
+  }
+  // gunwale rail caps
+  for(var side=-1;side<=1;side+=2){
+    for(var i5=0;i5<NS;i5++){
+      var s0c=st[i5], s1c=st[i5+1];
+      var x0=side*s0c.beam*1.02, x1=side*s1c.beam*1.02;
+      quad(m,[x0,s0c.rail,s0c.z],[x0+side*0.22,s0c.rail+0.10,s0c.z],
+            [x1+side*0.22,s1c.rail+0.10,s1c.z],[x1,s1c.rail,s1c.z],vary(C.hullTrim,i5,side+3));
+    }
+  }
+  // bow post / stern post base
+  tube(m,[[0,3.0,16.0],[0,4.6,16.7]], [0.62,0.55], 5, C.dragon, 4);
+  tube(m,[[0,2.6,-16.2],[0,4.4,-16.9]], [0.58,0.50], 5, C.dragon, 6);
+
+  // dragon neck + head
+  tube(m,[[0,4.4,15.6],[0,6.1,16.2],[0,7.9,16.6],[0,9.5,16.8],[0,10.7,17.3],[0,11.3,18.0]],
+       [0.86,0.74,0.66,0.64,0.66,0.60], 6, C.dragon, 20);
+  tube(m,[[0,11.2,17.4],[0,11.5,18.6],[0,11.2,19.8],[0,10.6,20.7]],
+       [0.80,0.92,0.68,0.30], 5, C.dragonLit, 40);
+  tube(m,[[0,10.2,17.6],[0,10.0,18.9],[0,9.7,19.9],[0,9.6,20.4]],
+       [0.40,0.34,0.20,0.08], 4, C.dragon, 60);
+  tube(m,[[0.42,11.6,17.8],[1.05,12.9,16.4],[1.45,13.3,15.1]], [0.20,0.13,0.03], 4, C.gold, 70);
+  tube(m,[[-0.42,11.6,17.8],[-1.05,12.9,16.4],[-1.45,13.3,15.1]], [0.20,0.13,0.03], 4, C.gold, 71);
+  // eyes
+  quad(m,[0.62,11.35,18.1],[0.62,11.55,18.35],[0.60,11.28,18.55],[0.60,11.10,18.28],C.gold);
+  quad(m,[-0.62,11.35,18.1],[-0.62,11.55,18.35],[-0.60,11.28,18.55],[-0.60,11.10,18.28],C.gold);
+  // teeth
+  for(var tt=0;tt<3;tt++){
+    var zt=18.4+tt*0.55;
+    tri(m,[0.22,10.05,zt],[0.22,9.55,zt+0.05],[0.36,9.98,zt+0.16],[0.90,0.88,0.80]);
+    tri(m,[-0.22,10.05,zt],[-0.22,9.55,zt+0.05],[-0.36,9.98,zt+0.16],[0.90,0.88,0.80]);
+  }
+
+  // stern spiral
+  tube(m,[[0,4.6,-16.9],[0,6.4,-17.6],[0,7.9,-17.0],[0,8.3,-15.7],[0,7.7,-14.8],[0,6.9,-15.3]],
+       [0.52,0.44,0.34,0.26,0.18,0.08], 5, C.dragon, 80);
+
+  // mast + yard
+  tube(m,[[0,2.2,2.0],[0,8.0,2.0],[0,12.8,2.0],[0,15.3,2.0]], [0.34,0.30,0.24,0.17], 6, C.wood, 90);
+  tube(m,[[-9.3,12.55,2.15],[0,12.72,2.15],[9.3,12.55,2.15]], [0.17,0.22,0.17], 5, C.wood, 95);
+
+  // shields
+  var shieldCols=[C.shieldRed,C.shieldCream,C.shieldOchre,C.shieldRed,C.shieldCream,C.shieldOchre,C.shieldRed];
+  for(var side2=-1;side2<=1;side2+=2){
+    for(var sh=0;sh<7;sh++){
+      var tz=-10.2+sh*3.45;
+      var tsh=(tz+L/2)/L;
+      var stt=st[Math.max(0,Math.min(NS,Math.round(tsh*NS)))];
+      var cx=side2*(stt.beam*0.99+0.10);
+      var cy=stt.rail+0.55;
+      var r=1.18;
+      var seg=10;
+      var face=shieldCols[sh%shieldCols.length];
+      for(var k3=0;k3<seg;k3++){
+        var a0=k3/seg*Math.PI*2, a1=(k3+1)/seg*Math.PI*2;
+        var p0=[cx, cy+Math.cos(a0)*r, tz+Math.sin(a0)*r];
+        var p1=[cx, cy+Math.cos(a1)*r, tz+Math.sin(a1)*r];
+        // rim
+        var p0i=[cx+side2*0.03, cy+Math.cos(a0)*r*0.78, tz+Math.sin(a0)*r*0.78];
+        var p1i=[cx+side2*0.03, cy+Math.cos(a1)*r*0.78, tz+Math.sin(a1)*r*0.78];
+        tri(m,p0,p1,p1i,vary([0.16,0.15,0.14],sh,k3));
+        tri(m,p0,p1i,p0i,vary([0.16,0.15,0.14],sh,k3+1));
+        // face
+        var p0f=[cx+side2*0.06, cy+Math.cos(a0)*r*0.74, tz+Math.sin(a0)*r*0.74];
+        var p1f=[cx+side2*0.06, cy+Math.cos(a1)*r*0.74, tz+Math.sin(a1)*r*0.74];
+        var p0c=[cx+side2*0.07, cy+Math.cos(a0)*0.24, tz+Math.sin(a0)*0.24];
+        var p1c=[cx+side2*0.07, cy+Math.cos(a1)*0.24, tz+Math.sin(a1)*0.24];
+        quad(m,p0f,p1f,p1c,p0c,vary(face,sh*4,k3));
+        tri(m,[cx+side2*0.14,cy+0.24,tz],[cx+side2*0.14,cy-0.24,tz],[cx+side2*0.30,cy,tz],C.iron);
+      }
+    }
+  }
+  return m;
+}
+
+function buildSail(){
+  var m=M();
+  var nx=14, ny=8, topY=12.45, botY=6.05, zz=2.15;
+  function pt(u,v){
+    var w=(9.0-0.85*v);
+    return [-w+2*w*u, topY+(botY-topY)*v, zz];
+  }
+  for(var i=0;i<nx;i++){
+    for(var j=0;j<ny;j++){
+      var u0=i/nx, u1=(i+1)/nx, v0=j/ny, v1=(j+1)/ny;
+      var a=pt(u0,v0), b=pt(u1,v0), c=pt(u1,v1), d=pt(u0,v1);
+      var stripe=Math.floor(u0*7.0+0.001);
+      var col=(stripe%2===0)?C.sailCream:C.sailRed;
+      if(j===0||j===ny-1) col=C.sailTrim;
+      var f=0.92+0.16*h2(i*3.1+2,j*1.7+5);
+      var cc=[Math.min(1,col[0]*f),Math.min(1,col[1]*f),Math.min(1,col[2]*f)];
+      triUV(m,a,b,c,cc,[u0,v0],[u1,v0],[u1,v1]);
+      triUV(m,a,c,d,cc,[u0,v0],[u1,v1],[u0,v1]);
+    }
+  }
+  return m;
+}
+
+function buildOar(){
+  var m=M();
+  // shaft along +x, slight downward
+  var p0=[0,0,0], p1=[9.6,-0.55,0];
+  var uu=[0,1,0], vv=[0,0,1], r0=0.14, r1=0.10;
+  for(var k=0;k<2;k++){
+    var q0=add(p0,[0,k?-r0:r0,0]), q1=add(p0,[0,0,k?-r0:r0]);
+    var q2=add(p1,[0,0,k?-r1:r1]), q3=add(p1,[0,k?-r1:r1,0]);
+    quad(m,q0,q1,q2,q3,vary(C.wood,3,k));
+  }
+  // blade
+  var bx=8.6;
+  quad(m,[bx,-0.62,-0.10],[bx,-0.62,0.10],[10.9,-0.78,0.34],[10.9,-0.78,-0.34],vary(C.wood,5,2));
+  quad(m,[bx,-0.50,-0.10],[bx,-0.50,0.10],[10.9,-0.66,0.34],[10.9,-0.66,-0.34],vary(C.wood,7,2));
+  quad(m,[bx,-0.62,-0.10],[bx,-0.50,-0.10],[10.9,-0.66,-0.34],[10.9,-0.78,-0.34],vary(C.wood,9,2));
+  quad(m,[bx,-0.62,0.10],[bx,-0.50,0.10],[10.9,-0.66,0.34],[10.9,-0.78,0.34],vary(C.wood,11,2));
+  return m;
+}
+
+function buildLines(){
+  var v=[];
+  function line(a,b){
+    v.push(a[0],a[1],a[2], 0,1,0, 0.10,0.09,0.08, 0,0);
+    v.push(b[0],b[1],b[2], 0,1,0, 0.10,0.09,0.08, 0,0);
+  }
+  line([0,15.2,2.0],[0,5.0,15.6]);
+  line([0,15.2,2.0],[0,4.6,-16.6]);
+  line([0,14.6,2.0],[4.2,3.2,2.0]);
+  line([0,14.6,2.0],[-4.2,3.2,2.0]);
+  line([0,14.6,2.0],[4.2,3.2,-6.0]);
+  line([0,14.6,2.0],[-4.2,3.2,-6.0]);
+  return new Float32Array(v);
+}
+
+/* ---------------- buffers ---------------- */
+function interleave(m){
+  var n=m.p.length/3;
+  var out=new Float32Array(n*11);
+  for(var i=0;i<n;i++){
+    out[i*11+0]=m.p[i*3];
+    out[i*11+1]=m.p[i*3+1];
+    out[i*11+2]=m.p[i*3+2];
+    out[i*11+3]=m.n[i*3];
+    out[i*11+4]=m.n[i*3+1];
+    out[i*11+5]=m.n[i*3+2];
+    out[i*11+6]=m.c[i*3];
+    out[i*11+7]=m.c[i*3+1];
+    out[i*11+8]=m.c[i*3+2];
+    out[i*11+9]=m.u[i*2];
+    out[i*11+10]=m.u[i*2+1];
+  }
+  return out;
+}
+function makeVAO(data, stride){
+  var vao=gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  var buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);
+  var S=stride*4;
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,S,0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.FLOAT,false,S,12);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,3,gl.FLOAT,false,S,24);
+  gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3,2,gl.FLOAT,false,S,36);
+  gl.bindVertexArray(null);
+  return {vao:vao,buf:buf,count:data.length/stride};
+}
+
+var terrainMesh=buildTerrain();
+var shipMesh=buildShip();
+var sailMesh=buildSail();
+var oarMesh=buildOar();
+var lineData=buildLines();
+
+var terrainVAO=makeVAO(interleave(terrainMesh),11);
+var shipVAO=makeVAO(interleave(shipMesh),11);
+var sailVAO=makeVAO(interleave(sailMesh),11);
+var oarVAO=makeVAO(interleave(oarMesh),11);
+
+var lineVAO=gl.createVertexArray();
+gl.bindVertexArray(lineVAO);
+var lineBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,lineBuf);
+gl.bufferData(gl.ARRAY_BUFFER,lineData,gl.STATIC_DRAW);
+var LS=11*4;
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,LS,0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.FLOAT,false,LS,12);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,3,gl.FLOAT,false,LS,24);
+gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3,2,gl.FLOAT,false,LS,36);
+gl.bindVertexArray(null);
+var lineCount=lineData.length/11;
+
+// water grid
+var waterVAO=(function(){
+  var verts=[];
+  var W=1900, Z0=-760, Z1=1250, nx=150, nz=150;
+  var idx=[];
+  for(var j=0;j<=nz;j++)for(var i=0;i<=nx;i++){
+    verts.push(-W/2+W*i/nx, 0, Z0+(Z1-Z0)*j/nz);
+  }
+  for(var j2=0;j2<nz;j2++)for(var i2=0;i2<nx;i2++){
+    var a=j2*(nx+1)+i2, b=a+1, c=a+nx+1, d=c+1;
+    idx.push(a,c,b, b,c,d);
+  }
+  var vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+  var vb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,vb);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(verts),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,12,0);
+  var ib=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint32Array(idx),gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return {vao:vao,count:idx.length};
+})();
+
+var skyVAO=gl.createVertexArray();
+gl.bindVertexArray(skyVAO);
+var skyBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,skyBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1, 3,-1, -1,3]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+gl.bindVertexArray(null);
+
+/* ---------------- shaders ---------------- */
+function compile(type,src){
+  var s=gl.createShader(type);
+  gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s),src);
+  return s;
+}
+function program(vs,fs){
+  var p=gl.createProgram();
+  gl.attachShader(p,compile(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p,compile(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  return p;
+}
+function U(p,names){
+  var o={};
+  for(var i=0;i<names.length;i++) o[names[i]]=gl.getUniformLocation(p,names[i]);
+  return o;
+}
+
+var ATMO = [
+'uniform vec3 uCam; uniform vec3 uSun; uniform float uTime;',
+'vec3 atmos(vec3 col, vec3 w){',
+'  vec3 v = w - uCam; float d = length(v); vec3 rd = v/max(d,1e-4);',
+'  float sd = pow(max(dot(rd,uSun),0.0),4.0);',
+'  vec3 fc = mix(vec3(0.615,0.678,0.712), vec3(1.0,0.795,0.575), sd*0.78);',
+'  float df = 1.0-exp(-pow(d*0.00158,2.0));',
+'  float mist = exp(-max(w.y,0.0)*0.031)*(1.0-exp(-d*0.0033))*0.85;',
+'  mist *= 0.78+0.22*sin(w.x*0.036+uTime*0.17)*sin(w.z*0.022-uTime*0.11);',
+'  return mix(col, fc, clamp(df+mist,0.0,0.965));',
+'}'
+].join('\n');
+
+var VS_MAIN = [
+'#version 300 es',
+'precision highp float;',
+'layout(location=0) in vec3 aPos;',
+'layout(location=1) in vec3 aNormal;',
+'layout(location=2) in vec3 aColor;',
+'layout(location=3) in vec2 aUV;',
+'uniform mat4 uModel; uniform mat4 uViewProj; uniform float uTime; uniform float uSail;',
+'out vec3 vW; out vec3 vN; out vec3 vC; out vec2 vUV;',
+'void main(){',
+'  vec3 p = aPos;',
+'  if(uSail > 0.5){',
+'    float u=aUV.x, v=aUV.y;',
+'    float ed = sin(3.14159265*u)*sin(3.14159265*v);',
+'    p.z += ed*(1.30 + 0.20*sin(u*6.0+uTime*2.3) + 0.11*sin(v*5.0-uTime*1.8));',
+'    p.y += 0.11*sin(u*4.0+uTime*1.5)*ed;',
+'  }',
+'  vec4 w = uModel*vec4(p,1.0);',
+'  vW=w.xyz; vN=mat3(uModel)*aNormal; vC=aColor; vUV=aUV;',
+'  gl_Position=uViewProj*w;',
+'}'
+].join('\n');
+
+var FS_MAIN = [
+'#version 300 es',
+'precision highp float;',
+'in vec3 vW; in vec3 vN; in vec3 vC; in vec2 vUV;',
+ATMO,
+'out vec4 frag;',
+'void main(){',
+'  vec3 n=normalize(vN);',
+'  vec3 V=normalize(uCam-vW);',
+'  if(dot(n,V)<0.0) n=-n;',
+'  float ndl=max(dot(n,uSun),0.0);',
+'  float amb=0.52+0.30*max(n.y,0.0);',
+'  vec3 col=vC*(vec3(0.44,0.50,0.57)*amb + vec3(1.0,0.81,0.58)*ndl*1.25);',
+'  float rim=pow(1.0-max(dot(n,V),0.0),4.0);',
+'  col += vec3(1.0,0.86,0.63)*rim*0.10;',
+'  col = atmos(col,vW);',
+'  frag=vec4(col,1.0);',
+'}'
+].join('\n');
+
+var VS_SKY = [
+'#version 300 es',
+'precision highp float;',
+'layout(location=0) in vec2 aPos;',
+'out vec2 vNdc;',
+'void main(){ vNdc=aPos; gl_Position=vec4(aPos,0.999,1.0); }'
+].join('\n');
+
+var FS_SKY = [
+'#version 300 es',
+'precision highp float;',
+'in vec2 vNdc;',
+'uniform vec3 uCamF, uCamR, uCamU; uniform float uTanF, uAspect, uTime; uniform vec3 uSun;',
+'out vec4 frag;',
+'void main(){',
+'  vec3 dir=normalize(uCamF + uCamR*(vNdc.x*uTanF*uAspect) + uCamU*(vNdc.y*uTanF));',
+'  float h=dir.y;',
+'  vec3 low=vec3(0.965,0.815,0.665);',
+'  vec3 mid=vec3(0.635,0.700,0.755);',
+'  vec3 top=vec3(0.235,0.385,0.500);',
+'  vec3 col=mix(low,mid,smoothstep(-0.03,0.26,h));',
+'  col=mix(col,top,smoothstep(0.16,0.85,h));',
+'  float sd=max(dot(dir,uSun),0.0);',
+'  col += vec3(1.0,0.66,0.34)*pow(sd,6.0)*0.34;',
+'  col += vec3(1.0,0.85,0.62)*pow(sd,120.0)*1.1;',
+'  col += vec3(0.24,0.12,0.05)*exp(-abs(h)*8.0)*0.55;',
+'  float cl=smoothstep(0.55,0.95, sin(dir.x*2.1+dir.z*1.2)*0.5+0.5);',
+'  cl*=smoothstep(0.04,0.22,h)*(1.0-smoothstep(0.42,0.72,h));',
+'  col=mix(col,vec3(1.0,0.87,0.76),cl*0.20);',
+'  // faint distant ridge haze at horizon',
+'  col=mix(col,vec3(0.80,0.79,0.79),smoothstep(0.02,-0.05,h)*0.4);',
+'  frag=vec4(col,1.0);',
+'}'
+].join('\n');
+
+var VS_WATER = [
+'#version 300 es',
+'precision highp float;',
+'layout(location=0) in vec3 aPos;',
+'uniform mat4 uViewProj; uniform float uTime; uniform vec3 uOffset;',
+'out vec3 vW; out vec3 vN;',
+'float wh(vec2 p, float t){',
+'  return sin(p.x*0.105+t*0.85)*0.21 + sin(p.y*0.082-t*0.70)*0.16',
+'       + sin((p.x*0.7+p.y*0.9)*0.23+t*1.5)*0.065',
+'       + sin((p.x*0.5-p.y*0.8)*0.41-t*2.3)*0.032;',
+'}',
+'void main(){',
+'  vec3 p=aPos+uOffset;',
+'  p.y += wh(p.xz,uTime);',
+'  float e=0.55;',
+'  float dx=wh(p.xz+vec2(e,0.0),uTime)-wh(p.xz-vec2(e,0.0),uTime);',
+'  float dz=wh(p.xz+vec2(0.0,e),uTime)-wh(p.xz-vec2(0.0,e),uTime);',
+'  vN=normalize(vec3(-dx,2.0*e,-dz));',
+'  vW=p;',
+'  gl_Position=uViewProj*vec4(p,1.0);',
+'}'
+].join('\n');
+
+var FS_WATER = [
+'#version 300 es',
+'precision highp float;',
+'in vec3 vW; in vec3 vN;',
+'uniform vec4 uShip;',
+ATMO,
+'out vec4 frag;',
+'float h21(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }',
+'float vn2(vec2 p){',
+'  vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.0-2.0*f);',
+'  return mix(mix(h21(i),h21(i+vec2(1,0)),u.x), mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),u.x), u.y);',
+'}',
+'float fbm2(vec2 p){ return vn2(p)*0.6+vn2(p*2.3+11.0)*0.28+vn2(p*5.1-7.0)*0.12; }',
+'float rip(vec2 p){',
+'  return sin(p.x*2.1+uTime*1.6)*0.5+sin(p.y*2.7-uTime*1.2)*0.5+sin((p.x+p.y)*3.3+uTime*2.0)*0.32;',
+'}',
+'void main(){',
+'  vec3 V=normalize(uCam-vW);',
+'  vec3 N=normalize(vN + vec3(rip(vW.xz*0.30)*0.055, 0.0, rip(vW.xz*0.27+13.0)*0.055));',
+'  vec3 R=reflect(-V,N); R.y=abs(R.y);',
+'  float fres=pow(1.0-max(dot(N,V),0.0),4.0);',
+'  float sd=max(dot(R,uSun),0.0);',
+'  vec3 skyRef=mix(vec3(0.50,0.60,0.66), vec3(1.0,0.79,0.55), pow(sd,3.0)*0.85);',
+'  float lam=clamp(dot(N,uSun)*0.5+0.5,0.0,1.0);',
+'  vec3 deep=vec3(0.018,0.050,0.058);',
+'  vec3 teal=vec3(0.055,0.125,0.130);',
+'  vec3 col=mix(deep,teal,lam*0.85);',
+'  col += skyRef*fres*0.85;',
+'  vec3 H=normalize(uSun+V);',
+'  float spec=pow(max(dot(N,H),0.0),200.0);',
+'  float glit=0.55+0.9*fbm2(vW.xz*0.9+vec2(uTime*0.1,0.0));',
+'  col += vec3(1.0,0.80,0.55)*spec*2.1*glit;',
+'  col += vec3(1.0,0.83,0.60)*pow(max(dot(N,H),0.0),20.0)*0.10;',
+'  // wake',
+'  vec2 fwd=vec2(sin(uShip.z),cos(uShip.z));',
+'  vec2 rgt=vec2(fwd.y,-fwd.x);',
+'  vec2 rel=vW.xz-vec2(uShip.x,uShip.y);',
+'  float aft=-dot(rel,fwd);',
+'  float lat=dot(rel,rgt);',
+'  float d=max(aft,0.0);',
+'  float n1=fbm2(vW.xz*0.22+vec2(0.0,uTime*0.18));',
+'  float n2=fbm2(vW.xz*0.75-vec2(uTime*0.10,uTime*0.26));',
+'  float cw=2.0+d*0.055;',
+'  float center=smoothstep(cw,cw*0.28,abs(lat))*smoothstep(-2.0,3.0,aft);',
+'  center*=exp(-d*0.0055);',
+'  float armD=abs(abs(lat)-(2.7+d*0.19));',
+'  float arm=smoothstep(2.6,0.15,armD)*smoothstep(-4.0,7.0,aft)*exp(-d*0.011);',
+'  float bowD=length(vec2(aft+15.5, abs(lat)-4.4));',
+'  float bow=smoothstep(5.0,0.4,bowD)*0.75;',
+'  float patchy=smoothstep(0.22,0.80,n1*0.62+n2*0.55);',
+'  float foam=clamp((center*1.05+arm*0.85+bow)*(0.38+0.95*patchy),0.0,1.0);',
+'  vec3 foamCol=vec3(0.88,0.91,0.90)*(0.55+0.6*max(dot(N,uSun),0.0));',
+'  col=mix(col,foamCol,foam*0.88);',
+'  col=atmos(col,vW);',
+'  frag=vec4(col,1.0);',
+'}'
+].join('\n');
+
+var mainProg=program(VS_MAIN,FS_MAIN);
+var mainU=U(mainProg,['uModel','uViewProj','uTime','uSail','uCam','uSun']);
+var skyProg=program(VS_SKY,FS_SKY);
+var skyU=U(skyProg,['uCamF','uCamR','uCamU','uTanF','uAspect','uTime','uSun']);
+var waterProg=program(VS_WATER,FS_WATER);
+var waterU=U(waterProg,['uViewProj','uTime','uOffset','uCam','uSun','uShip']);
+
+/* ---------------- resize ---------------- */
+var DPR=1, VW=1, VH=1;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1, 2);
+  VW=Math.max(1,Math.floor(window.innerWidth*DPR));
+  VH=Math.max(1,Math.floor(window.innerHeight*DPR));
+  canvas.width=VW; canvas.height=VH;
+  canvas.style.width='100vw'; canvas.style.height='100vh';
+}
+window.addEventListener('resize',resize);
+resize();
+
+/* ---------------- scene state ---------------- */
+var SUN=norm([0.72,0.27,-0.42]);
+var T0=performance.now();
+var shipZ=0, shipX=0, yaw=-0.13;
+
+function frame(now){
+  var t=(now-T0)/1000;
+  var dt=Math.min(0.05, Math.max(0.001,(now-frame.last||now)/1000));
+  frame.last=now;
+
+  var speed=4.4;
+  shipZ += speed*dt;
+  shipX = centerX(shipZ) + Math.sin(t*0.21)*1.6;
+  yaw = -0.13 + 0.022*Math.sin(t*0.13);
+
+  var bobY = Math.sin(t*0.85)*0.16 + Math.sin(t*1.63+1.1)*0.05;
+  var roll = Math.sin(t*0.72)*0.020 + Math.sin(t*1.31+0.4)*0.006;
+  var pitch = Math.sin(t*0.93+0.5)*0.012;
+
+  var shipM = mul(mul(mul(trans(shipX,bobY,shipZ), rotY(yaw)), rotZ(roll)), rotX(pitch));
+
+  // camera
+  var camOff=[46+1.6*Math.sin(t*0.11), 12.5+0.5*Math.sin(t*0.17+1.2), -36+1.0*Math.sin(t*0.09+0.6)];
+  var camPos=[shipX+camOff[0], camOff[1]+bobY*0.4, shipZ+camOff[2]];
+  var target=[shipX+1.0, 5.0+bobY*0.3, shipZ+3.0];
+  var fwd=norm(sub(target,camPos));
+  var rgt=norm(cross(fwd,[0,1,0]));
+  var upv=cross(rgt,fwd);
+  var fov=46*Math.PI/180;
+  var aspect=VW/VH;
+  var vp=mul(persp(fov,aspect,0.5,4200), lookAt(camPos,target,[0,1,0]));
+
+  gl.viewport(0,0,VW,VH);
+  gl.disable(gl.CULL_FACE);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  gl.clearColor(0.42,0.47,0.50,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+  // sky
+  gl.depthMask(false);
+  gl.useProgram(skyProg);
+  gl.uniform3fv(skyU.uCamF,fwd);
+  gl.uniform3fv(skyU.uCamR,rgt);
+  gl.uniform3fv(skyU.uCamU,upv);
+  gl.uniform1f(skyU.uTanF,Math.tan(fov/2));
+  gl.uniform1f(skyU.uAspect,aspect);
+  gl.uniform1f(skyU.uTime,t);
+  gl.uniform3fv(skyU.uSun,SUN);
+  gl.bindVertexArray(skyVAO);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.depthMask(true);
+
+  // main program state
+  gl.useProgram(mainProg);
+  gl.uniformMatrix4fv(mainU.uViewProj,false,vp);
+  gl.uniform3fv(mainU.uCam,camPos);
+  gl.uniform3fv(mainU.uSun,SUN);
+  gl.uniform1f(mainU.uTime,t);
+  gl.uniform1f(mainU.uSail,0);
+
+  // terrain
+  gl.uniformMatrix4fv(mainU.uModel,false,ident());
+  gl.bindVertexArray(terrainVAO.vao);
+  gl.drawArrays(gl.TRIANGLES,0,terrainVAO.count);
+
+  // water
+  gl.useProgram(waterProg);
+  gl.uniformMatrix4fv(waterU.uViewProj,false,vp);
+  gl.uniform1f(waterU.uTime,t);
+  gl.uniform3f(waterU.uOffset,0,0,shipZ+240);
+  gl.uniform3fv(waterU.uCam,camPos);
+  gl.uniform3fv(waterU.uSun,SUN);
+  gl.uniform4f(waterU.uShip,shipX,shipZ,yaw,0);
+  gl.bindVertexArray(waterVAO.vao);
+  gl.drawElements(gl.TRIANGLES,waterVAO.count,gl.UNSIGNED_INT,0);
+
+  // ship
+  gl.useProgram(mainProg);
+  gl.uniform1f(mainU.uSail,0);
+  gl.uniformMatrix4fv(mainU.uModel,false,shipM);
+  gl.bindVertexArray(shipVAO.vao);
+  gl.drawArrays(gl.TRIANGLES,0,shipVAO.count);
+
+  // sail
+  gl.uniform1f(mainU.uSail,1);
+  gl.bindVertexArray(sailVAO.vao);
+  gl.drawArrays(gl.TRIANGLES,0,sailVAO.count);
+
+  // rigging lines
+  gl.uniform1f(mainU.uSail,0);
+  gl.bindVertexArray(lineVAO);
+  gl.drawArrays(gl.LINES,0,lineCount);
+
+  // oars
+  var rowPhase=t*1.55;
+  for(var side=-1;side<=1;side+=2){
+    for(var i=0;i<6;i++){
+      var zi=-12.2+i*4.6;
+      var sweep=Math.sin(rowPhase)*0.30;
+      var om;
+      if(side>0){
+        om=mul(mul(trans(4.15,2.45,zi), rotY(-0.22+sweep)), rotZ(-0.15));
+      } else {
+        om=mul(mul(trans(-4.15,2.45,zi), rotY(Math.PI+0.22-sweep)), rotZ(-0.15));
+      }
+      gl.uniformMatrix4fv(mainU.uModel,false,mul(shipM,om));
+      gl.bindVertexArray(oarVAO.vao);
+      gl.drawArrays(gl.TRIANGLES,0,oarVAO.count);
+    }
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
