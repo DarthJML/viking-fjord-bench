@@ -20,7 +20,7 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 ## Honest notes
 - Not a strict one-shot benchmark: some earlier entries had runtime repairs, and retests used corrected model IDs.
 - The Fable 5.2 entry self-checked with headless screenshots; it was not hand-edited.
-- The Gemini 4 Hydrogen entry is a single attempt with no repairs, run through Nous Portal on its release day (about 3.5 minutes, 6 model calls). Gemini 4 Carbon was run the same day with the same prompt and did not finish: three requests each timed out after 30 minutes, so it has no entry.
+- The Gemini 4 Hydrogen entry is a single attempt with no repairs, run through Nous Portal on its release day (about 3.5 minutes, 6 model calls). Gemini 4 Carbon was run the same day with the same prompt and did not finish: three requests failed after 20 to 30 minutes each with no output, so it has no entry.
 - Videos on X are captured from these actual HTML files, not generated video.
 
 Made by [@DarthJML](https://x.com/DarthJML) with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
