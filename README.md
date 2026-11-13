@@ -19,6 +19,7 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 | 2026-11-13 | Grok 4.6 | [scenes/grok-4.6.html](scenes/grok-4.6.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/grok-4.6.html) |
 | 2026-11-13 | GPT-6.1 Sol | [scenes/gpt-6.1-sol.html](scenes/gpt-6.1-sol.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/gpt-6.1-sol.html) |
 | 2026-11-13 | Claude Opus 5.5 | [scenes/opus-5.5.html](scenes/opus-5.5.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/opus-5.5.html) |
+| 2026-11-13 | Grok 4.7 | [scenes/grok-4.7.html](scenes/grok-4.7.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/grok-4.7.html) |
 
 ## Honest notes
 - Not a strict one-shot benchmark: some earlier entries had runtime repairs, and retests used corrected model IDs.
@@ -28,5 +29,6 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 - Grok 4.6 (2026-11-13) hit its turn limit; the same session fixed the sail, shields and colour afterwards, so the live file is the repaired version.
 - GPT-6.1 Sol (2026-11-13) had its motion tuned after a parent review of the clock and the ship's travel.
 - Claude Opus 5.5 (2026-11-13) is a one-shot: no repairs, no retries.
+- Grok 4.7 (2026-11-13) was stopped during its own self-verification; the file is as it was written at that point and was checked headless afterwards (longship, sail, shields, scene motion, no console errors).
 
 Made by [@DarthJML](https://x.com/DarthJML) with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
