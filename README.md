@@ -20,6 +20,8 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 | 2026-11-13 | GPT-6.1 Sol | [scenes/gpt-6.1-sol.html](scenes/gpt-6.1-sol.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/gpt-6.1-sol.html) |
 | 2026-11-13 | Claude Opus 5.5 | [scenes/opus-5.5.html](scenes/opus-5.5.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/opus-5.5.html) |
 | 2026-11-13 | Grok 4.7 | [scenes/grok-4.7.html](scenes/grok-4.7.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/grok-4.7.html) |
+| 2026-11-16 | Qwen 4 Max | [scenes/qwen-4-max.html](scenes/qwen-4-max.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/qwen-4-max.html) |
+| 2026-11-16 | HY4 Flash (free) | [scenes/hy4-flash.html](scenes/hy4-flash.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/hy4-flash.html) |
 
 ## Honest notes
 - Not a strict one-shot benchmark: some earlier entries had runtime repairs, and retests used corrected model IDs.
@@ -30,5 +32,7 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 - GPT-6.1 Sol (2026-11-13) had its motion tuned after a parent review of the clock and the ship's travel.
 - Claude Opus 5.5 (2026-11-13) is a one-shot: no repairs, no retries.
 - Grok 4.7 (2026-11-13) was stopped during its own self-verification; the file is as it was written at that point and was checked headless afterwards (longship, sail, shields, scene motion, no console errors).
+- Qwen 4 Max (2026-11-16, Nous Portal, the day after it launched) is a single unassisted run: 63 model calls over about 68 minutes, self-checked with its own headless renders, no repairs by us. An earlier attempt was cut off by a 5-minute timer and produced nothing.
+- HY4 Flash (2026-11-16, the free tier on Nous Portal) is a single unassisted run: 26 model calls in under 5 minutes, no repairs. It has no shield row along the hull.
 
 Made by [@DarthJML](https://x.com/DarthJML) with [Hermes Agent](https://github.com/NousResearch/hermes-agent).

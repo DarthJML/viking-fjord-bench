@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Longship — Fjord at Golden Hour</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#0b0d14; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  #grade { position:fixed; inset:0; pointer-events:none;
+    background:
+      radial-gradient(ellipse 120% 95% at 50% 42%, rgba(0,0,0,0) 52%, rgba(8,6,14,0.42) 100%),
+      linear-gradient(to bottom, rgba(10,8,18,0.16), rgba(0,0,0,0) 14%, rgba(0,0,0,0) 86%, rgba(6,5,12,0.28));
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="grade"></div>
+<script>
+"use strict";
+/* ============================================================
+   LONGSHIP — a stylized low-poly fjord at golden hour.
+   Raw WebGL, zero dependencies. One file.
+   ============================================================ */
+
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl", { antialias:true, alpha:false, depth:true, powerPreference:"high-performance" })
+        || canvas.getContext("experimental-webgl");
+if (!gl) { document.body.style.background = "#1a1420"; throw new Error("WebGL unavailable"); }
+
+/* ---------------- tiny math ---------------- */
+function m4Ident(){ return [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; }
+function m4Mul(a,b){
+  const o = new Array(16);
+  for (let c=0;c<4;c++) for (let r=0;r<4;r++){
+    o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+  }
+  return o;
+}
+function m4T(x,y,z){ return [1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]; }
+function m4RX(a){ const c=Math.cos(a),s=Math.sin(a); return [1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]; }
+function m4RY(a){ const c=Math.cos(a),s=Math.sin(a); return [c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]; }
+function m4RZ(a){ const c=Math.cos(a),s=Math.sin(a); return [c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]; }
+function m4Persp(fov,asp,n,f){
+  const t = 1/Math.tan(fov/2);
+  return [t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,2*f*n/(n-f),0];
+}
+function m4LookAt(e,c,u){
+  let zx=e[0]-c[0], zy=e[1]-c[1], zz=e[2]-c[2];
+  let l=Math.hypot(zx,zy,zz); zx/=l; zy/=l; zz/=l;
+  let xx=u[1]*zz-u[2]*zy, xy=u[2]*zx-u[0]*zz, xz=u[0]*zy-u[1]*zx;
+  l=Math.hypot(xx,xy,xz); xx/=l; xy/=l; xz/=l;
+  const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  return [xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+    -(xx*e[0]+xy*e[1]+xz*e[2]), -(yx*e[0]+yy*e[1]+yz*e[2]), -(zx*e[0]+zy*e[1]+zz*e[2]), 1];
+}
+function clamp(x,a,b){ return x<a?a:(x>b?b:x); }
+function smooth(a,b,x){ const t=clamp((x-a)/(b-a),0,1); return t*t*(3-2*t); }
+
+/* deterministic hash / value noise (shared CPU side) */
+function hash1(n){ const s=Math.sin(n*127.1+311.7)*43758.5453; return s-Math.floor(s); }
+function vnoise(x){
+  const i=Math.floor(x), f=x-i, u=f*f*(3-2*f);
+  return hash1(i)*(1-u)+hash1(i+1)*u;
+}
+function vnoise2(x,y){
+  const ix=Math.floor(x), iy=Math.floor(y), fx=x-ix, fy=y-iy;
+  const ux=fx*fx*(3-2*fx), uy=fy*fy*(3-2*fy);
+  const a=hash1(ix+iy*157.0), b=hash1(ix+1+iy*157.0);
+  const c=hash1(ix+(iy+1)*157.0), d=hash1(ix+1+(iy+1)*157.0);
+  return a+(b-a)*ux+(c-a)*uy+(a-b-c+d)*ux*uy;
+}
+
+/* ---------------- shaders ---------------- */
+function compile(type, src){
+  const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)+"\n"+src);
+  return s;
+}
+function program(vs,fs){
+  const p=gl.createProgram();
+  gl.attachShader(p,compile(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p,compile(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const MESH_VS = `
+precision highp float;
+attribute vec3 aPos; attribute vec3 aNrm; attribute vec3 aCol;
+uniform mat4 uModel, uVP;
+varying vec3 vN; varying vec3 vCol; varying vec3 vW;
+void main(){
+  vec4 w = uModel * vec4(aPos,1.0);
+  vW = w.xyz;
+  vN = mat3(uModel[0].xyz, uModel[1].xyz, uModel[2].xyz) * aNrm;
+  vCol = aCol;
+  gl_Position = uVP * w;
+}`;
+
+const MESH_FS = `
+precision highp float;
+varying vec3 vN; varying vec3 vCol; varying vec3 vW;
+uniform vec3 uCam, uSunDir, uSunCol, uFog;
+uniform float uFogD, uTrans;
+void main(){
+  vec3 n = normalize(vN);
+  if (!gl_FrontFacing) n = -n;
+  vec3 V = normalize(uCam - vW);
+  float dif = clamp((dot(n,uSunDir)+0.55)/1.55, 0.0, 1.0);
+  dif = dif*dif*(3.0-2.0*dif);
+  vec3 amb = vec3(0.235,0.27,0.385);
+  vec3 fill = vec3(0.10,0.115,0.16) * clamp(dot(n, normalize(vec3(0.55,0.35,0.75))),0.0,1.0);
+  float rim = pow(1.0-clamp(dot(n,V),0.0,1.0), 3.0);
+  vec3 col = vCol * (amb + fill + uSunCol*dif*1.28) + uSunCol*rim*(0.34+0.55*dif)*1.15;
+  /* backlit translucency (sail canvas glowing against the sun) */
+  col += vCol * uSunCol * clamp(-dot(n,uSunDir),0.0,1.0) * uTrans;
+  /* gilded figurehead gleam (only the gold head color matches) */
+  float gleam = smoothstep(0.5,0.8,vCol.r)*smoothstep(0.45,0.6,vCol.g)*(1.0-smoothstep(0.2,0.35,vCol.b));
+  col += vec3(0.30,0.19,0.05)*gleam;
+  float dist = length(uCam - vW);
+  float f = 1.0-exp(-dist*uFogD);
+  /* haze settles in the fjord; high snowy peaks rise above it */
+  f *= clamp(exp(-(vW.y-14.0)*0.013), 0.22, 1.0);
+  vec3 fc = mix(uFog, uSunCol*0.92+vec3(0.12), pow(clamp(dot(normalize(vW-uCam),uSunDir),0.0,1.0),5.0)*0.55);
+  col = mix(col, fc, f);
+  gl_FragColor = vec4(col,1.0);
+}`;
+
+const WATER_VS = `
+precision highp float;
+attribute vec3 aPos;
+uniform mat4 uVP;
+uniform float uT, uScroll;
+varying vec3 vW; varying vec3 vN;
+float wave(vec2 p, vec2 d, float k, float A, float sp, float t, inout vec2 grad){
+  float ph = dot(p,d)*k + t*sp;
+  grad += d*k*A*cos(ph);
+  return A*sin(ph);
+}
+void main(){
+  vec3 p = aPos;
+  vec2 q = vec2(p.x, p.z - uScroll);
+  vec2 g = vec2(0.0);
+  float y = 0.0;
+  y += wave(q, normalize(vec2(0.18,1.0)), 0.140, 0.24, 1.05, uT, g);
+  y += wave(q, normalize(vec2(-0.38,0.92)), 0.230, 0.13, 1.60, uT, g);
+  y += wave(q, normalize(vec2(0.62,0.78)), 0.430, 0.065, 2.20, uT, g);
+  y += wave(q, normalize(vec2(-0.10,1.0)), 0.052, 0.30, 0.45, uT, g);
+  y += wave(q, normalize(vec2(0.9,0.35)), 0.80, 0.030, 2.9, uT, g);
+  p.y = y;
+  vN = normalize(vec3(-g.x, 1.0, -g.y));
+  vW = p;
+  gl_Position = uVP * vec4(p,1.0);
+}`;
+
+const WATER_FS = `
+precision highp float;
+varying vec3 vW; varying vec3 vN;
+uniform vec3 uCam, uSunDir, uSunCol, uFog;
+uniform float uT, uFogD;
+uniform vec2 uOars[8];
+float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+float vn(vec2 p){
+  vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.0-2.0*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return a+(b-a)*u.x+(c-a)*u.y+(a-b-c+d)*u.x*u.y;
+}
+void main(){
+  vec3 n = normalize(vN);
+  vec3 V = normalize(uCam - vW);
+  float fres = pow(1.0-clamp(dot(n,V),0.0,1.0), 3.0);
+  vec3 deep = vec3(0.022,0.052,0.064);
+  vec3 refl = vec3(0.52,0.36,0.27);
+  vec3 col = mix(deep, refl, fres*0.62+0.04);
+  float dif = clamp(dot(n,uSunDir),0.0,1.0);
+  col += vec3(0.05,0.045,0.035)*dif;
+  vec3 H = normalize(uSunDir+V);
+  float sp = clamp(dot(n,H),0.0,1.0);
+  col += uSunCol * (pow(sp,220.0)*2.4 + pow(sp,26.0)*0.14);
+  /* hull shadow pools under the ship */
+  float sh = exp(-(vW.x*vW.x*0.16 + vW.z*vW.z*0.022));
+  col *= 1.0-0.38*sh;
+  /* ---- wake ---- */
+  float f = 0.0;
+  float z = vW.z;
+  if (z > -1.0) {
+    float zz = max(z,0.0);
+    float w = 1.15 + zz*0.055;
+    float body = smoothstep(w, w*0.30, abs(vW.x));
+    float fade = exp(-zz*0.024);
+    float turb = vn(vec2(vW.x*0.95, zz*0.55 - uT*2.3));
+    float turb2 = vn(vec2(vW.x*2.6+7.0, zz*1.5 - uT*4.1));
+    f += body*fade*(0.28+0.72*turb)*(0.55+0.45*turb2);
+    float e = abs(abs(vW.x) - (1.75 + zz*0.155));
+    f += exp(-e*e*1.5)*exp(-zz*0.020)*(0.45+0.55*vn(vec2(vW.x*2.1, zz*1.25-uT*3.2)))*0.85;
+  }
+  /* bow spray */
+  float db = length(vec2(vW.x*0.75, (z+8.9)*1.15));
+  f += exp(-db*db*0.32)*(0.35+0.45*vn(vec2(vW.x*3.0, z*3.0-uT*5.0)))*0.55;
+  /* oar dips — only near the ship; one shared noise sample instead of eight */
+  if (abs(vW.x)>3.0 && abs(vW.x)<10.5 && z>-8.0 && z<8.0){
+    float on = vn(vec2(vW.x*3.2, z*3.2-uT*5.5));
+    float dx = abs(vW.x)-6.1;
+    for (int i=0;i<8;i++){
+      vec2 o = uOars[i];
+      float dz = z-o.x;
+      float d2 = dx*dx*0.9+dz*dz*1.1;
+      f += o.y*exp(-d2*0.55)*(0.4+0.6*on)*0.8;
+    }
+  }
+  /* sparse ambient whitecaps */
+  float cap = vn(vec2(vW.x*0.35, (z-uT*1.2)*0.35));
+  f += smoothstep(0.86,0.95,cap)*0.10;
+  f = clamp(f,0.0,0.92);
+  vec3 foamCol = vec3(0.86,0.84,0.80)*(vec3(0.30,0.30,0.34)+uSunCol*0.85);
+  col = mix(col, foamCol, f);
+  float dist = length(uCam - vW);
+  float fog = 1.0-exp(-dist*uFogD);
+  vec3 fc = mix(uFog, uSunCol*0.92+vec3(0.12), pow(clamp(dot(normalize(vW-uCam),uSunDir),0.0,1.0),5.0)*0.55);
+  col = mix(col, fc, fog);
+  gl_FragColor = vec4(col,1.0);
+}`;
+
+const SKY_VS = `
+precision highp float;
+attribute vec2 aPos;
+varying vec2 vP;
+void main(){ vP = aPos; gl_Position = vec4(aPos,0.9999,1.0); }`;
+
+const SKY_FS = `
+precision highp float;
+varying vec2 vP;
+uniform vec3 uFwd, uRight, uUp, uSunDir, uSunCol, uFog;
+uniform float uTan, uAsp, uT;
+float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+float vn(vec2 p){
+  vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.0-2.0*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return a+(b-a)*u.x+(c-a)*u.y+(a-b-c+d)*u.x*u.y;
+}
+void main(){
+  vec3 ray = normalize(uFwd + vP.x*uTan*uAsp*uRight + vP.y*uTan*uUp);
+  float t = clamp(ray.y, 0.0, 1.0);
+  vec3 horizon = vec3(0.99,0.66,0.36);
+  vec3 mid = vec3(0.46,0.36,0.46);
+  vec3 zenith = vec3(0.09,0.15,0.30);
+  vec3 col = mix(horizon, mid, smoothstep(0.0,0.20,t));
+  col = mix(col, zenith, smoothstep(0.10,0.62,t));
+  if (ray.y < 0.0) col = mix(horizon, uFog, clamp(-ray.y*8.0,0.0,1.0));
+  float d = clamp(dot(ray,uSunDir),0.0,1.0);
+  col += uSunCol*(pow(d,6.0)*0.20 + pow(d,42.0)*0.50);
+  col += uSunCol*smoothstep(0.99935,0.99975,d)*1.7;
+  /* drifting golden cloud streaks */
+  float band = smoothstep(0.015,0.10,ray.y)*smoothstep(0.52,0.13,ray.y);
+  float u = ray.x/(0.22+ray.y);
+  float s1 = vn(vec2(u*1.7 + uT*0.008, ray.y*16.0));
+  float s2 = vn(vec2(u*4.2 - uT*0.013, ray.y*34.0+5.0));
+  float cl = smoothstep(0.58,0.85, s1*0.65+s2*0.35)*band;
+  col = mix(col, vec3(1.02,0.72,0.47), cl*0.42);
+  col = mix(col, vec3(0.36,0.30,0.42), cl*smoothstep(0.30,0.05,ray.y)*0.20);
+  gl_FragColor = vec4(col,1.0);
+}`;
+
+const meshProg = program(MESH_VS, MESH_FS);
+const waterProg = program(WATER_VS, WATER_FS);
+const skyProg = program(SKY_VS, SKY_FS);
+
+function uni(p, names){ const o={}; for(const n of names) o[n]=gl.getUniformLocation(p,n); return o; }
+const MU = uni(meshProg, ["uModel","uVP","uCam","uSunDir","uSunCol","uFog","uFogD","uTrans"]);
+const WU = uni(waterProg, ["uVP","uT","uScroll","uCam","uSunDir","uSunCol","uFog","uFogD","uOars[0]"]);
+const SU = uni(skyProg, ["uFwd","uRight","uUp","uSunDir","uSunCol","uFog","uTan","uAsp","uT"]);
+const MA = { pos:gl.getAttribLocation(meshProg,"aPos"), nrm:gl.getAttribLocation(meshProg,"aNrm"), col:gl.getAttribLocation(meshProg,"aCol") };
+const WA = gl.getAttribLocation(waterProg,"aPos");
+const SA = gl.getAttribLocation(skyProg,"aPos");
+
+/* ---------------- mesh building ---------------- */
+/* interleaved pos3 nrm3 col3 */
+function Mesh(){ this.a=[]; }
+Mesh.prototype.tri = function(a,b,c,col){
+  const ux=b[0]-a[0], uy=b[1]-a[1], uz=b[2]-a[2];
+  const vx=c[0]-a[0], vy=c[1]-a[1], vz=c[2]-a[2];
+  let nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+  const l=Math.hypot(nx,ny,nz)||1; nx/=l; ny/=l; nz/=l;
+  for (const p of [a,b,c]) this.a.push(p[0],p[1],p[2], nx,ny,nz, col[0],col[1],col[2]);
+};
+Mesh.prototype.quad = function(a,b,c,d,col){ this.tri(a,b,c,col); this.tri(a,c,d,col); };
+Mesh.prototype.box = function(cx,cy,cz,sx,sy,sz,col){
+  const x=sx/2,y=sy/2,z=sz/2;
+  const p=[
+    [cx-x,cy-y,cz-z],[cx+x,cy-y,cz-z],[cx+x,cy+y,cz-z],[cx-x,cy+y,cz-z],
+    [cx-x,cy-y,cz+z],[cx+x,cy-y,cz+z],[cx+x,cy+y,cz+z],[cx-x,cy+y,cz+z]
+  ];
+  this.quad(p[0],p[1],p[2],p[3],col); this.quad(p[5],p[4],p[7],p[6],col);
+  this.quad(p[4],p[0],p[3],p[7],col); this.quad(p[1],p[5],p[6],p[2],col);
+  this.quad(p[3],p[2],p[6],p[7],col); this.quad(p[4],p[5],p[1],p[0],col);
+};
+Mesh.prototype.upload = function(dynamic){
+  const data = new Float32Array(this.a);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, dynamic?gl.DYNAMIC_DRAW:gl.STATIC_DRAW);
+  return { buf, count: data.length/9, data };
+};
+function drawMesh(m, model){
+  gl.bindBuffer(gl.ARRAY_BUFFER, m.buf);
+  gl.vertexAttribPointer(MA.pos,3,gl.FLOAT,false,36,0);
+  gl.vertexAttribPointer(MA.nrm,3,gl.FLOAT,false,36,12);
+  gl.vertexAttribPointer(MA.col,3,gl.FLOAT,false,36,24);
+  gl.uniformMatrix4fv(MU.uModel,false,model);
+  gl.drawArrays(gl.TRIANGLES,0,m.count);
+}
+
+/* ---------------- the longship ---------------- */
+const WOOD_D=[0.26,0.165,0.095], WOOD_M=[0.345,0.225,0.125], WOOD_L=[0.42,0.285,0.16],
+      WOOD_DK=[0.17,0.105,0.06], TAR=[0.10,0.075,0.055], GOLD=[0.92,0.68,0.24];
+
+function hullParams(z){
+  const t=(z+8.5)/17;
+  const w=1.78*Math.pow(Math.max(Math.sin(Math.PI*t),0.001),0.72)+0.06;
+  const e=Math.pow(Math.abs(z)/8.5, 2.6);
+  const keelY=-0.58+1.55*e;
+  const gunY=1.12+1.75*Math.pow(Math.abs(z)/8.5,2.3);
+  return {w,keelY,gunY};
+}
+
+const ship = new Mesh();
+(function buildHull(){
+  const N=18, zs=[];
+  for(let i=0;i<=N;i++) zs.push(-8.5+17*i/N);
+  const strakeCols=[WOOD_D, WOOD_M, WOOD_D, WOOD_L];
+  for(const s of [-1,1]){
+    for(let i=0;i<N;i++){
+      const z0=zs[i], z1=zs[i+1];
+      const h0=hullParams(z0), h1=hullParams(z1);
+      const ring=(h)=>{
+        const dy=h.gunY-h.keelY;
+        return [
+          [s*0.20*h.w, h.keelY],
+          [s*0.70*h.w, h.keelY+0.42*dy],
+          [s*0.96*h.w, h.keelY+0.74*dy],
+          [s*1.03*h.w, h.gunY]
+        ];
+      };
+      const r0=ring(h0), r1=ring(h1);
+      for(let k=0;k<3;k++){
+        const jitter = 0.92+0.16*hash1(i*7+k*31+s*13);
+        const c=[strakeCols[k][0]*jitter, strakeCols[k][1]*jitter, strakeCols[k][2]*jitter];
+        ship.quad(
+          [r0[k][0],r0[k][1],z0],[r1[k][0],r1[k][1],z1],
+          [r1[k+1][0],r1[k+1][1],z1],[r0[k+1][0],r0[k+1][1],z0], c);
+      }
+      /* gunwale cap */
+      ship.quad(
+        [r0[3][0],r0[3][1],z0],[r1[3][0],r1[3][1],z1],
+        [s*0.86*h1.w,h1.gunY+0.02,z1],[s*0.86*h0.w,h0.gunY+0.02,z0], WOOD_DK);
+    }
+  }
+  /* deck planks + thwarts */
+  for(let i=0;i<14;i++){
+    const z0=-7.4+14.8*i/14, z1=-7.4+14.8*(i+1)/14;
+    const w0=hullParams(z0).w*0.82, w1=hullParams(z1).w*0.82;
+    const c = i%2 ? [0.24,0.16,0.09] : [0.28,0.19,0.11];
+    ship.quad([-w0,0.30,z0],[w0,0.30,z0],[w1,0.30,z1],[-w1,0.30,z1],c);
+  }
+  for(let i=0;i<7;i++){
+    const z=-5.6+11.2*i/6;
+    const w=hullParams(z).w*0.9;
+    ship.box(0,0.52,z, w*2,0.10,0.30, WOOD_DK);
+  }
+  /* keel fin */
+  ship.box(0,-0.62,0, 0.14,0.34,16.4, TAR);
+})();
+
+/* lofted tube along a centerline — used for stem curls */
+function loftTube(mesh, pts, sides, col, colJitter){
+  const rings=[];
+  for(let i=0;i<pts.length;i++){
+    const p=pts[i];
+    const prev=pts[Math.max(0,i-1)], next=pts[Math.min(pts.length-1,i+1)];
+    let tx=next[0]-prev[0], ty=next[1]-prev[1], tz=next[2]-prev[2];
+    const tl=Math.hypot(tx,ty,tz)||1; tx/=tl; ty/=tl; tz/=tl;
+    /* frame: reference up */
+    let ux=0, uy=1, uz=0;
+    if (Math.abs(ty)>0.92){ ux=1; uy=0; }
+    let bx=ty*uz-tz*uy, by=tz*ux-tx*uz, bz=tx*uy-ty*ux;
+    const bl=Math.hypot(bx,by,bz)||1; bx/=bl; by/=bl; bz/=bl;
+    ux=by*tz-bz*ty; uy=bz*tx-bx*tz; uz=bx*ty-by*tx;
+    const ring=[];
+    for(let k=0;k<sides;k++){
+      const a=2*Math.PI*k/sides + 0.3;
+      const ca=Math.cos(a), sa=Math.sin(a);
+      ring.push([p[0]+(bx*ca+ux*sa)*p[3], p[1]+(by*ca+uy*sa)*p[3], p[2]+(bz*ca+uz*sa)*p[3]]);
+    }
+    rings.push(ring);
+  }
+  for(let i=0;i<rings.length-1;i++){
+    for(let k=0;k<sides;k++){
+      const k2=(k+1)%sides;
+      const j = colJitter ? (0.88+0.24*hash1(i*11+k*5)) : 1;
+      const c=[col[0]*j,col[1]*j,col[2]*j];
+      mesh.quad(rings[i][k], rings[i+1][k], rings[i+1][k2], rings[i][k2], c);
+    }
+  }
+}
+
+/* dragon prow: tall rising stem, curled neck, angular gilded head */
+(function buildProw(){
+  const neck=[
+    [0,1.10,-8.30,0.46],[0,2.25,-8.88,0.40],[0,3.45,-9.24,0.34],
+    [0,4.65,-9.40,0.30],[0,5.75,-9.30,0.27],[0,6.55,-9.00,0.25],[0,6.95,-8.58,0.23]
+  ];
+  loftTube(ship, neck, 6, WOOD_D, true);
+  /* skull → snout, reaching forward */
+  const head=[
+    [0,7.00,-8.58,0.28],[0,6.95,-9.35,0.28],[0,6.78,-10.15,0.21],[0,6.55,-10.95,0.13]
+  ];
+  loftTube(ship, head, 5, GOLD, false);
+  /* lower jaw, slightly open */
+  const jaw=[
+    [0,6.55,-8.80,0.18],[0,6.32,-9.65,0.14],[0,6.15,-10.55,0.08]
+  ];
+  loftTube(ship, jaw, 4, [0.45,0.30,0.11], false);
+  /* teeth */
+  for(let i=0;i<3;i++){
+    const z=-9.45-i*0.42;
+    for(const s of [-1,1]){
+      ship.tri([s*0.15,6.62,z],[s*0.15,6.62,z-0.18],[s*0.11,6.38,z-0.09],[0.88,0.84,0.72]);
+    }
+  }
+  /* eyes */
+  for(const s of [-1,1]){
+    ship.quad([s*0.27,7.10,-9.05],[s*0.27,7.10,-9.30],[s*0.27,6.94,-9.30],[s*0.27,6.94,-9.05],[0.05,0.03,0.02]);
+  }
+  /* swept horns / ears */
+  for(const s of [-1,1]){
+    ship.tri([s*0.14,7.20,-8.55],[s*0.36,7.80,-7.90],[s*0.22,7.18,-8.90],[0.55,0.40,0.16]);
+    ship.tri([s*0.36,7.80,-7.90],[s*0.14,7.20,-8.55],[s*0.22,7.18,-8.90],[0.38,0.27,0.11]);
+  }
+})();
+
+/* stern curl */
+(function buildStern(){
+  const pts=[
+    [0,1.10,8.30,0.42],[0,2.25,8.85,0.36],[0,3.40,9.16,0.30],
+    [0,4.40,9.22,0.25],[0,5.15,9.00,0.21],[0,5.50,8.62,0.17],[0,5.42,8.28,0.13]
+  ];
+  loftTube(ship, pts, 6, WOOD_D, true);
+})();
+
+/* shields along both gunwales */
+(function buildShields(){
+  const RED=[0.55,0.13,0.10], CREAM=[0.84,0.77,0.60], RIM=[0.14,0.095,0.065], BOSS=[0.34,0.32,0.30];
+  const SEG=12, R=0.60;
+  for(const s of [-1,1]){
+    for(let i=0;i<9;i++){
+      const z=-6.4+12.8*i/8;
+      const h=hullParams(z);
+      const cx=s*(h.w*1.03+0.09), cy=h.gunY+0.04;
+      const tilt=s*0.14;
+      /* disc plane faces outward (+-X), tilted so top leans out */
+      const face=(a,r,off)=>[cx+s*off, cy+Math.cos(a)*r*Math.cos(tilt), z+Math.sin(a)*r+Math.cos(a)*r*Math.sin(tilt)*s];
+      for(let k=0;k<SEG;k++){
+        const a0=2*Math.PI*k/SEG, a1=2*Math.PI*(k+1)/SEG;
+        const quadCol = (Math.floor(k/3)%2===0) ? RED : CREAM;
+        /* rim ring */
+        ship.quad(face(a0,R,0), face(a1,R,0), face(a1,R*0.86,0.012), face(a0,R*0.86,0.012), RIM);
+        /* quadrant fan */
+        ship.tri(face(a0,R*0.86,0.012), face(a1,R*0.86,0.012), face((a0+a1)/2,0.001,0.02), quadCol);
+      }
+      /* boss */
+      for(let k=0;k<6;k++){
+        const a0=2*Math.PI*k/6, a1=2*Math.PI*(k+1)/6;
+        ship.tri(face(a0,0.15,0.05), face(a1,0.15,0.05), face(0,0.001,0.10), BOSS);
+      }
+    }
+  }
+})();
+
+/* mast, yard, rigging */
+(function buildRig(){
+  ship.box(0,4.80,-0.8, 0.30,9.0,0.30, WOOD_M);
+  ship.box(0,8.78,-0.8, 8.9,0.18,0.18, WOOD_DK);
+  /* mast fish / base */
+  ship.box(0,0.62,-0.8, 0.7,0.5,0.9, WOOD_DK);
+  const rope=[0.07,0.055,0.045];
+  const stay=(p,q)=>{
+    const dx=q[0]-p[0], dy=q[1]-p[1], dz=q[2]-p[2];
+    const l=Math.hypot(dx,dy,dz);
+    /* thin ribbon, offset in x */
+    const o=0.022;
+    ship.quad([p[0]-o,p[1],p[2]],[p[0]+o,p[1],p[2]],[q[0]+o,q[1],q[2]],[q[0]-o,q[1],q[2]],rope);
+  };
+  stay([0,9.25,-0.8],[0,2.35,-8.1]);
+  stay([0,9.25,-0.8],[0,2.6,8.0]);
+  stay([0,9.0,-0.8],[-1.6,1.25,2.4]);
+  stay([0,9.0,-0.8],[1.6,1.25,2.4]);
+  stay([-4.4,8.78,-0.8],[-1.5,1.2,-4.6]);
+  stay([4.4,8.78,-0.8],[1.5,1.2,-4.6]);
+})();
+const shipMesh = ship.upload(false);
+
+/* sail — dynamic grid, striped, billowing */
+const SAIL_COLS=12, SAIL_ROWS=9;
+const sailMesh = new Mesh();
+const sailBuf = gl.createBuffer();
+const sailVertCount = (SAIL_COLS*SAIL_ROWS*6) + 6;
+const sailData = new Float32Array(sailVertCount*9);
+function updateSail(t){
+  let o=0;
+  const push=(p,n,c)=>{ sailData[o++]=p[0]; sailData[o++]=p[1]; sailData[o++]=p[2];
+    sailData[o++]=n[0]; sailData[o++]=n[1]; sailData[o++]=n[2];
+    sailData[o++]=c[0]; sailData[o++]=c[1]; sailData[o++]=c[2]; };
+  const RED=[0.60,0.135,0.10], CREAM=[0.86,0.79,0.64];
+  const pt=(i,j)=>{
+    const u=i/SAIL_COLS, v=j/SAIL_ROWS;
+    const x=-4.2+8.4*u + 0.10*Math.sin(t*0.9)*v;
+    const y=8.62-5.45*v;
+    const billow=(0.92+0.14*Math.sin(t*1.15)+0.05*Math.sin(t*2.3+1.0))
+      * Math.sin(Math.PI*u) * Math.sin(Math.PI*Math.min(v*1.12,1.0));
+    const flutter=0.06*Math.sin(u*9.0+t*4.2)*v + 0.03*Math.sin(v*7.0+t*3.1)*u;
+    return [x, y + 0.05*Math.sin(u*6.0+t*2.0)*v, -0.8 - billow - flutter];
+  };
+  for(let j=0;j<SAIL_ROWS;j++){
+    for(let i=0;i<SAIL_COLS;i++){
+      const a=pt(i,j), b=pt(i+1,j), c=pt(i+1,j+1), d=pt(i,j+1);
+      const base=(Math.floor(i/2)%2===0)?RED:CREAM;
+      const shade=0.92+0.08*(j/SAIL_ROWS);
+      const col=[base[0]*shade,base[1]*shade,base[2]*shade];
+      for(const tr of [[a,b,c],[a,c,d]]){
+        const ux=tr[1][0]-tr[0][0], uy=tr[1][1]-tr[0][1], uz=tr[1][2]-tr[0][2];
+        const vx=tr[2][0]-tr[0][0], vy=tr[2][1]-tr[0][1], vz=tr[2][2]-tr[0][2];
+        let nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+        const l=Math.hypot(nx,ny,nz)||1;
+        const n=[nx/l,ny/l,nz/l];
+        push(tr[0],n,col); push(tr[1],n,col); push(tr[2],n,col);
+      }
+    }
+  }
+  /* masthead pennant */
+  const fl=0.25*Math.sin(t*5.0);
+  const p0=[0,9.62,-0.8], p1=[0,9.30,-0.8], p2=[-1.15,9.46+fl*0.3,-0.8+fl];
+  const n=[0,0,1];
+  push(p0,n,[0.58,0.13,0.10]); push(p1,n,[0.58,0.13,0.10]); push(p2,n,[0.72,0.18,0.12]);
+  push(p0,n,[0.58,0.13,0.10]); push(p2,n,[0.72,0.18,0.12]); push(p1,n,[0.58,0.13,0.10]);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sailBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, sailData, gl.DYNAMIC_DRAW);
+}
+function drawSail(model){
+  gl.bindBuffer(gl.ARRAY_BUFFER, sailBuf);
+  gl.vertexAttribPointer(MA.pos,3,gl.FLOAT,false,36,0);
+  gl.vertexAttribPointer(MA.nrm,3,gl.FLOAT,false,36,12);
+  gl.vertexAttribPointer(MA.col,3,gl.FLOAT,false,36,24);
+  gl.uniformMatrix4fv(MU.uModel,false,model);
+  gl.drawArrays(gl.TRIANGLES,0,sailVertCount);
+}
+
+/* oar — one mesh, drawn per station */
+const oarBuilder=new Mesh();
+(function(){
+  oarBuilder.box(2.15,0,0, 4.3,0.075,0.075, WOOD_L);
+  oarBuilder.quad([4.3,0,-0.05],[5.05,0,-0.16],[5.05,0,0.16],[4.3,0,0.05],[0.36,0.24,0.13]);
+  oarBuilder.quad([4.3,0.04,-0.05],[5.05,0.04,-0.16],[5.05,0.04,0.16],[4.3,0.04,0.05],[0.30,0.20,0.11]);
+  oarBuilder.box(0.1,0,0, 0.5,0.10,0.10, WOOD_DK);
+})();
+const oarMesh=oarBuilder.upload(false);
+
+/* ---------------- fjord terrain ---------------- */
+const CHUNK_L=48;
+const chunkCache=new Map();
+const COL_OFF=[0,5,12,22,36,55,80];
+const COL_H=[0.4,9,24,45,68,92,110];
+function terrainHeight(worldZ, col, side){
+  if(col===0) return 0.35+0.5*vnoise(worldZ*0.15+side*9);
+  const mod=0.62+0.75*vnoise(worldZ*0.011+col*3.7+side*13.1);
+  const detail=3.2*vnoise(worldZ*0.055+col*9.3+side*4.7);
+  return COL_H[col]*mod+detail;
+}
+function shoreX(worldZ, side){ return 27+7*vnoise(worldZ*0.013+side*7.3); }
+function buildChunk(wi){
+  const m=new Mesh();
+  const ROWS=8;
+  for(const side of [-1,1]){
+    const grid=[];
+    for(let r=0;r<=ROWS;r++){
+      const lz=CHUNK_L*r/ROWS;
+      const wz=wi*CHUNK_L+lz;
+      const shore=shoreX(wz,side);
+      const row=[];
+      for(let c=0;c<COL_OFF.length;c++){
+        const x=side*(shore+COL_OFF[c]);
+        const y=terrainHeight(wz,c,side);
+        row.push([x,y,lz]);
+      }
+      grid.push(row);
+    }
+    for(let r=0;r<ROWS;r++){
+      for(let c=0;c<COL_OFF.length-1;c++){
+        const a=grid[r][c], b=grid[r][c+1], cc=grid[r+1][c+1], d=grid[r+1][c];
+        const hAvg=(a[1]+b[1]+cc[1]+d[1])/4;
+        const wz=wi*CHUNK_L+CHUNK_L*(r+0.5)/ROWS;
+        const snowLine=44+14*vnoise(wz*0.02+side*3);
+        const j=0.90+0.20*hash1(wi*37+r*11+c*5+side*101);
+        let col;
+        if(hAvg>snowLine){ col=[0.88*j,0.87*j,0.92*j]; }
+        else if(hAvg<9.5){ col=[0.075*j,0.12*j,0.07*j]; }
+        else if(hAvg<20){ col=[0.11*j,0.13*j,0.16*j]; }
+        else { col=[0.19*j,0.21*j,0.27*j]; }
+        m.quad(a,b,cc,d,col);
+      }
+    }
+  }
+  return m.upload(false);
+}
+function getChunk(wi){
+  let c=chunkCache.get(wi);
+  if(!c){ c=buildChunk(wi); chunkCache.set(wi,c); }
+  return c;
+}
+
+/* distant peaks, two hazy ranges with a gap for the sun */
+function buildRange(z, seed, baseCol, snowCol, hScale, gapX){
+  const m=new Mesh();
+  const N=44;
+  const tops=[];
+  for(let i=0;i<=N;i++){
+    const x=-270+540*i/N;
+    let h=(42+95*vnoise(x*0.012+seed))*hScale;
+    const gap=smooth(18,85,Math.abs(x-gapX));
+    h*=0.16+0.84*gap;
+    h+=8*vnoise(x*0.05+seed*3);
+    tops.push([x,h]);
+  }
+  for(let i=0;i<N;i++){
+    const x0=tops[i][0], x1=tops[i+1][0];
+    const h0=tops[i][1], h1=tops[i+1][1];
+    const xm=(x0+x1)/2 + (hash1(i+seed)-0.5)*6;
+    const hm=(h0+h1)/2 + (hash1(i*3+seed)-0.5)*10;
+    const j=0.9+0.2*hash1(i*7+seed);
+    const rock=[baseCol[0]*j,baseCol[1]*j,baseCol[2]*j];
+    const snow=[snowCol[0]*j,snowCol[1]*j,snowCol[2]*j];
+    const snowH=Math.min(h0,h1)*0.45;
+    m.tri([x0,-3,z],[x1,-3,z],[xm,hm,z],rock);
+    m.tri([x0,-3,z],[xm,hm,z],[x0,h0,z],rock);
+    m.tri([x1,-3,z],[x1,h1,z],[xm,hm,z],rock);
+    if(h0>snowH) m.tri([x0,h0,z],[xm,Math.max(hm,snowH),z],[x0+(xm-x0)*0.45,h0-(h0-snowH)*0.5,z],snow);
+    if(h1>snowH) m.tri([x1,h1,z],[x1-(x1-xm)*0.45,h1-(h1-snowH)*0.5,z],[xm,Math.max(hm,snowH),z],snow);
+  }
+  return m.upload(false);
+}
+const rangeFar=buildRange(-452, 3.3, [0.34,0.35,0.47],[0.92,0.88,0.95], 1.25, -24);
+const rangeNear=buildRange(-408, 8.1, [0.23,0.25,0.35],[0.80,0.77,0.86], 0.92, -24);
+
+/* ---------------- water grid ---------------- */
+const water=(function(){
+  const XS=80, ZS=130;
+  const x0=-170, x1=170, z0=-455, z1=95;
+  const verts=new Float32Array((XS+1)*(ZS+1)*3);
+  let o=0;
+  for(let j=0;j<=ZS;j++) for(let i=0;i<=XS;i++){
+    verts[o++]=x0+(x1-x0)*i/XS;
+    verts[o++]=0;
+    verts[o++]=z0+(z1-z0)*j/ZS;
+  }
+  const idx=new Uint16Array(XS*ZS*6);
+  o=0;
+  for(let j=0;j<ZS;j++) for(let i=0;i<XS;i++){
+    const a=j*(XS+1)+i, b=a+1, c=a+XS+1, d=c+1;
+    idx[o++]=a; idx[o++]=c; idx[o++]=b;
+    idx[o++]=b; idx[o++]=c; idx[o++]=d;
+  }
+  const vb=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,vb); gl.bufferData(gl.ARRAY_BUFFER,verts,gl.STATIC_DRAW);
+  const ib=gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,idx,gl.STATIC_DRAW);
+  return {vb,ib,count:idx.length};
+})();
+
+/* sky fullscreen triangle */
+const skyBuf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,skyBuf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1, 3,-1, -1,3]),gl.STATIC_DRAW);
+
+/* birds */
+const birdBuilder=new Mesh();
+birdBuilder.quad([0,0,0],[1.15,0.12,-0.18],[1.15,0.12,0.22],[0,0,0.14],[0.05,0.05,0.08]);
+const birdWing=birdBuilder.upload(false);
+const birds=[];
+for(let i=0;i<5;i++){
+  birds.push({
+    cx:-22+44*hash1(i*3+1), cy:13+9*hash1(i*7+2), cz:-55-70*hash1(i*11+3),
+    r:7+9*hash1(i*5+4), sp:(0.10+0.10*hash1(i*13+5))*(i%2?1:-1), ph:hash1(i*17+6)*6.28
+  });
+}
+
+/* ---------------- scene constants ---------------- */
+const SUN_DIR=(function(){ const v=[-0.05,0.17,-0.98]; const l=Math.hypot(...v); return [v[0]/l,v[1]/l,v[2]/l]; })();
+const SUN_COL=[1.0,0.60,0.30];
+const FOG=[0.80,0.58,0.44];
+const FOG_D=0.0033;
+const SPEED=3.1;
+const FOV=55*Math.PI/180;
+
+/* ---------------- resize ---------------- */
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1, 2);
+  const w=window.innerWidth, h=window.innerHeight;
+  let scale=DPR;
+  if(w*h*scale*scale>4.4e6) scale=Math.sqrt(4.4e6/(w*h));
+  W=Math.max(2,Math.round(w*scale)); H=Math.max(2,Math.round(h*scale));
+  if(canvas.width!==W||canvas.height!==H){ canvas.width=W; canvas.height=H; }
+  gl.viewport(0,0,W,H);
+}
+window.addEventListener("resize",resize);
+resize();
+
+/* ---------------- frame ---------------- */
+gl.enable(gl.DEPTH_TEST);
+gl.depthFunc(gl.LEQUAL);
+gl.disable(gl.CULL_FACE);
+gl.clearColor(FOG[0],FOG[1],FOG[2],1);
+
+const oarZs=[]; for(let i=0;i<8;i++) oarZs.push(-5.6+11.2*i/7);
+const oarUniform=new Float32Array(16);
+
+let start=performance.now();
+function frame(now){
+  const t=(now-start)/1000;
+  const s=t*SPEED;
+
+  /* camera — gentle stern-quarter drift: sail face lit by the low sun ahead,
+     hull profile + dragon prow silhouetted, wake trailing toward the lens */
+  const az=0.25*Math.sin(t*0.05)+0.85;
+  const dist=16.0+1.2*Math.sin(t*0.02+0.4);
+  const ch=3.6+0.6*Math.sin(t*0.027+1.7);
+  const cam=[Math.sin(az)*dist, ch, Math.cos(az)*dist];
+  const tgt=[0.2*Math.sin(t*0.013), 2.4+0.2*Math.sin(t*0.05), -2.0];
+  const view=m4LookAt(cam,tgt,[0,1,0]);
+  const proj=m4Persp(FOV,W/H,0.1,900);
+  const vp=m4Mul(proj,view);
+
+  /* ship motion */
+  const bob=0.18*Math.sin(t*0.9)+0.08*Math.sin(t*1.7+0.5);
+  const pitch=0.022*Math.sin(t*0.81+2.0);
+  const roll=0.035*Math.sin(t*0.62+0.8);
+  const shipM=m4Mul(m4T(0,bob,0), m4Mul(m4RX(pitch),m4RZ(roll)));
+
+  /* rowing */
+  const phase=t*2.4;
+  const sweep=0.38*Math.sin(phase);
+  const dip=-0.16+0.17*Math.cos(phase);
+  const power=0.4+0.6*Math.max(0,-Math.sin(phase));
+  for(let i=0;i<8;i++){
+    const h=hullParams(oarZs[i]);
+    const pivotY=h.gunY-0.12+bob;
+    const tipY=pivotY+Math.sin(dip)*4.95;
+    oarUniform[i*2]=oarZs[i];
+    oarUniform[i*2+1]=clamp((0.18-tipY)*1.6,0,1)*power;
+  }
+
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+
+  /* --- sky --- */
+  gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(skyProg);
+  const fwd=[tgt[0]-cam[0],tgt[1]-cam[1],tgt[2]-cam[2]];
+  const fl=Math.hypot(...fwd); fwd[0]/=fl; fwd[1]/=fl; fwd[2]/=fl;
+  let rx=fwd[2]*1-0, ry=0, rz=-fwd[0]; /* cross(fwd, up=(0,1,0)) -> (fwd.z*1? ) */
+  /* right = normalize(cross(fwd, up)) */
+  rx=fwd[1]*0-fwd[2]*1; ry=fwd[2]*0-fwd[0]*0; rz=fwd[0]*1-fwd[1]*0;
+  const rl=Math.hypot(rx,ry,rz)||1; rx/=rl; ry/=rl; rz/=rl;
+  const ux=ry*fwd[2]-rz*fwd[1], uy=rz*fwd[0]-rx*fwd[2], uz=rx*fwd[1]-ry*fwd[0];
+  gl.uniform3fv(SU.uFwd,fwd); gl.uniform3fv(SU.uRight,[rx,ry,rz]); gl.uniform3fv(SU.uUp,[ux,uy,uz]);
+  gl.uniform3fv(SU.uSunDir,SUN_DIR); gl.uniform3fv(SU.uSunCol,SUN_COL); gl.uniform3fv(SU.uFog,FOG);
+  gl.uniform1f(SU.uTan,Math.tan(FOV/2)); gl.uniform1f(SU.uAsp,W/H); gl.uniform1f(SU.uT,t);
+  gl.bindBuffer(gl.ARRAY_BUFFER,skyBuf);
+  gl.enableVertexAttribArray(SA);
+  gl.vertexAttribPointer(SA,2,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.disableVertexAttribArray(SA);
+  gl.enable(gl.DEPTH_TEST);
+
+  /* --- meshes --- */
+  gl.useProgram(meshProg);
+  gl.enableVertexAttribArray(MA.pos); gl.enableVertexAttribArray(MA.nrm); gl.enableVertexAttribArray(MA.col);
+  gl.uniformMatrix4fv(MU.uVP,false,vp);
+  gl.uniform3fv(MU.uCam,cam); gl.uniform3fv(MU.uSunDir,SUN_DIR);
+  gl.uniform3fv(MU.uSunCol,SUN_COL); gl.uniform3fv(MU.uFog,FOG); gl.uniform1f(MU.uFogD,FOG_D);
+  gl.uniform1f(MU.uTrans,0.0);
+
+  /* distant ranges */
+  drawMesh(rangeFar, m4Ident());
+  drawMesh(rangeNear, m4Ident());
+
+  /* fjord walls — recycled chunks, seamless */
+  const wiStart=Math.floor((-460-s)/CHUNK_L);
+  const wiEnd=Math.floor((90-s)/CHUNK_L);
+  for(let wi=wiStart;wi<=wiEnd;wi++){
+    drawMesh(getChunk(wi), m4T(0,0,wi*CHUNK_L+s));
+  }
+  for(const key of chunkCache.keys()){
+    const rz=key*CHUNK_L+s;
+    if(rz>140||rz<-560){ const c=chunkCache.get(key); gl.deleteBuffer(c.buf); chunkCache.delete(key); }
+  }
+
+  /* ship */
+  drawMesh(shipMesh, shipM);
+  updateSail(t);
+  gl.uniform1f(MU.uTrans,0.85);
+  drawSail(shipM);
+  gl.uniform1f(MU.uTrans,0.0);
+
+  /* oars */
+  for(let i=0;i<8;i++){
+    const z=oarZs[i];
+    const h=hullParams(z);
+    const py=h.gunY-0.12;
+    for(const side of [-1,1]){
+      const px=side*1.58;
+      const ry=(side>0)? sweep : Math.PI-sweep;
+      const m=m4Mul(shipM, m4Mul(m4T(px,py,z), m4Mul(m4RY(ry), m4RZ(dip))));
+      drawMesh(oarMesh,m);
+    }
+  }
+  /* steering oar, starboard aft */
+  {
+    const m=m4Mul(shipM, m4Mul(m4T(1.62,hullParams(7.0).gunY-0.2,7.0), m4Mul(m4RY(0.25), m4RZ(-0.42))));
+    drawMesh(oarMesh,m);
+  }
+
+  /* birds */
+  for(let i=0;i<birds.length;i++){
+    const b=birds[i];
+    const a=t*b.sp+b.ph;
+    const px=b.cx+Math.cos(a)*b.r;
+    const pz=b.cz+Math.sin(a)*b.r*0.6;
+    const py=b.cy+Math.sin(t*0.5+i*2)*1.4;
+    const flap=0.55*Math.sin(t*6.5+i*2.1);
+    const base=m4Mul(m4T(px,py,pz), m4RY(a+Math.PI/2));
+    drawMesh(birdWing, m4Mul(base,m4RZ(flap)));
+    const mirror=m4Mul(base, m4Mul(m4RY(Math.PI), m4RZ(-flap)));
+    drawMesh(birdWing, mirror);
+  }
+
+  /* --- water --- */
+  gl.useProgram(waterProg);
+  gl.disableVertexAttribArray(MA.nrm); gl.disableVertexAttribArray(MA.col);
+  gl.uniformMatrix4fv(WU.uVP,false,vp);
+  gl.uniform1f(WU.uT,t); gl.uniform1f(WU.uScroll,s);
+  gl.uniform3fv(WU.uCam,cam); gl.uniform3fv(WU.uSunDir,SUN_DIR);
+  gl.uniform3fv(WU.uSunCol,SUN_COL); gl.uniform3fv(WU.uFog,FOG); gl.uniform1f(WU.uFogD,FOG_D);
+  gl.uniform2fv(WU["uOars[0]"],oarUniform);
+  gl.bindBuffer(gl.ARRAY_BUFFER,water.vb);
+  gl.enableVertexAttribArray(WA);
+  gl.vertexAttribPointer(WA,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,water.ib);
+  gl.drawElements(gl.TRIANGLES,water.count,gl.UNSIGNED_SHORT,0);
+  gl.disableVertexAttribArray(WA);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
