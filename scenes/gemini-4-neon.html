@@ -1,0 +1,1970 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Viking Longship — Golden Hour Fjord</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#0b1320}
+canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', {
+  antialias: true,
+  alpha: false,
+  depth: true,
+  powerPreference: 'high-performance'
+}) || canvas.getContext('experimental-webgl');
+
+if (!gl) {
+  document.body.style.background = '#132030';
+  return;
+}
+
+const extDeriv = gl.getExtension('OES_standard_derivatives');
+const HAS_DERIV = !!extDeriv;
+
+// ---------------- Math & Matrix Helpers ----------------
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const smoothstep = (e0, e1, x) => {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+// Deterministic PRNG
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hash2(x, y) {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return s - Math.floor(s);
+}
+
+function noise2(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy), b = hash2(ix + 1, iy);
+  const c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+  return lerp(lerp(a, b, ux), lerp(c, d, ux), uy);
+}
+
+function fbm(x, y, oct = 4) {
+  let v = 0, amp = 0.5, freq = 1;
+  for (let i = 0; i < oct; i++) {
+    v += amp * noise2(x * freq, y * freq);
+    freq *= 2.03;
+    amp *= 0.5;
+  }
+  return v;
+}
+
+function mat4Create() {
+  const m = new Float32Array(16);
+  m[0] = m[5] = m[10] = m[15] = 1;
+  return m;
+}
+
+function mat4Identity(m) {
+  m.fill(0);
+  m[0] = m[5] = m[10] = m[15] = 1;
+  return m;
+}
+
+function mat4Perspective(out, fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy * 0.5);
+  const nf = 1 / (near - far);
+  out.fill(0);
+  out[0] = f / aspect;
+  out[5] = f;
+  out[10] = (far + near) * nf;
+  out[11] = -1;
+  out[14] = 2 * far * near * nf;
+  return out;
+}
+
+function mat4LookAt(out, eye, target, up) {
+  let zx = eye[0] - target[0], zy = eye[1] - target[1], zz = eye[2] - target[2];
+  let len = Math.hypot(zx, zy, zz) || 1;
+  zx /= len; zy /= len; zz /= len;
+
+  let xx = up[1] * zz - up[2] * zy;
+  let xy = up[2] * zx - up[0] * zz;
+  let xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz) || 1;
+  xx /= len; xy /= len; xz /= len;
+
+  const yx = zy * xz - zz * xy;
+  const yy = zz * xx - zx * xz;
+  const yz = zx * xy - zy * xx;
+
+  out[0] = xx; out[1] = yx; out[2] = zx; out[3] = 0;
+  out[4] = xy; out[5] = yy; out[6] = zy; out[7] = 0;
+  out[8] = xz; out[9] = yz; out[10] = zz; out[11] = 0;
+  out[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]);
+  out[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]);
+  out[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]);
+  out[15] = 1;
+  return out;
+}
+
+function mat4Mul(out, a, b) {
+  const r = new Float32Array(16);
+  for (let i = 0; i < 4; i++) {
+    const ai0 = a[i], ai1 = a[i + 4], ai2 = a[i + 8], ai3 = a[i + 12];
+    r[i]      = ai0 * b[0]  + ai1 * b[1]  + ai2 * b[2]  + ai3 * b[3];
+    r[i + 4]  = ai0 * b[4]  + ai1 * b[5]  + ai2 * b[6]  + ai3 * b[7];
+    r[i + 8]  = ai0 * b[8]  + ai1 * b[9]  + ai2 * b[10] + ai3 * b[11];
+    r[i + 12] = ai0 * b[12] + ai1 * b[13] + ai2 * b[14] + ai3 * b[15];
+  }
+  out.set(r);
+  return out;
+}
+
+function mat4TRS(out, tx, ty, tz, rx, ry, rz, sx = 1, sy = 1, sz = 1) {
+  const cx = Math.cos(rx), sxr = Math.sin(rx);
+  const cy = Math.cos(ry), syr = Math.sin(ry);
+  const cz = Math.cos(rz), szr = Math.sin(rz);
+  // R = Ry * Rx * Rz
+  const m00 = cy * cz + syr * sxr * szr;
+  const m01 = -cy * szr + syr * sxr * cz;
+  const m02 = syr * cx;
+  const m10 = cx * szr;
+  const m11 = cx * cz;
+  const m12 = -sxr;
+  const m20 = -syr * cz + cy * sxr * szr;
+  const m21 = syr * szr + cy * sxr * cz;
+  const m22 = cy * cx;
+
+  out[0] = m00 * sx; out[1] = m10 * sx; out[2] = m20 * sx; out[3] = 0;
+  out[4] = m01 * sy; out[5] = m11 * sy; out[6] = m21 * sy; out[7] = 0;
+  out[8] = m02 * sz; out[9] = m12 * sz; out[10] = m22 * sz; out[11] = 0;
+  out[12] = tx;      out[13] = ty;      out[14] = tz;      out[15] = 1;
+  return out;
+}
+
+// ---------------- Shader Compilation ----------------
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    console.error('Shader error:', gl.getShaderInfoLog(sh), src);
+    throw new Error(gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+
+function createProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error('Link error:', gl.getProgramInfoLog(p));
+    throw new Error(gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+// ---------------- Low-Poly Mesh Builder ----------------
+// Stride = 10 floats: px, py, pz, nx, ny, nz, r, g, b, meta
+// meta: 0=standard matte, 0.25=wood/shield slight spec, 0.5=gold/metal, 0.75=snow/ice, 1.0=emissive/waterfall
+class MeshBuilder {
+  constructor() {
+    this.data = [];
+    this.count = 0;
+  }
+
+  tri(a, b, c, col, meta = 0, jitter = 0.025) {
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    let nx = uy * vz - uz * vy;
+    let ny = uz * vx - ux * vz;
+    let nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz);
+    if (len < 1e-6) return;
+    nx /= len; ny /= len; nz /= len;
+
+    const j = jitter ? (hash2(a[0] * 13.7 + b[2] * 7.1, c[1] * 19.3 + b[0] * 5.3) - 0.5) * 2 * jitter : 0;
+    const r = clamp(col[0] + j, 0, 1);
+    const g = clamp(col[1] + j, 0, 1);
+    const bl = clamp(col[2] + j, 0, 1);
+
+    this.data.push(
+      a[0], a[1], a[2], nx, ny, nz, r, g, bl, meta,
+      b[0], b[1], b[2], nx, ny, nz, r, g, bl, meta,
+      c[0], c[1], c[2], nx, ny, nz, r, g, bl, meta
+    );
+    this.count += 3;
+  }
+
+  quad(a, b, c, d, col, meta = 0, jitter = 0.025) {
+    this.tri(a, b, c, col, meta, jitter);
+    this.tri(a, c, d, col, meta, jitter);
+  }
+
+  // Oriented box centered at (cx,cy,cz) with half-sizes (hx,hy,hz) and optional euler (rx,ry,rz)
+  box(cx, cy, cz, hx, hy, hz, col, meta = 0, rx = 0, ry = 0, rz = 0, jitter = 0.02) {
+    const m = mat4TRS(new Float32Array(16), cx, cy, cz, rx, ry, rz);
+    const pt = (x, y, z) => [
+      m[0]*x + m[4]*y + m[8]*z + m[12],
+      m[1]*x + m[5]*y + m[9]*z + m[13],
+      m[2]*x + m[6]*y + m[10]*z + m[14]
+    ];
+    const p000 = pt(-hx,-hy,-hz), p100 = pt(hx,-hy,-hz);
+    const p110 = pt(hx,hy,-hz),   p010 = pt(-hx,hy,-hz);
+    const p001 = pt(-hx,-hy,hz),  p101 = pt(hx,-hy,hz);
+    const p111 = pt(hx,hy,hz),    p011 = pt(-hx,hy,hz);
+    this.quad(p001, p101, p111, p011, col, meta, jitter); // +Z
+    this.quad(p100, p000, p010, p110, col, meta, jitter); // -Z
+    this.quad(p101, p100, p110, p111, col, meta, jitter); // +X
+    this.quad(p000, p001, p011, p010, col, meta, jitter); // -X
+    this.quad(p011, p111, p110, p010, col, meta, jitter); // +Y
+    this.quad(p000, p100, p101, p001, col, meta, jitter); // -Y
+  }
+
+  // Frustum / cylinder along Y axis from y0 to y1
+  frustum(cx, y0, cz, r0, r1, h, segs, col, meta = 0, jitter = 0.025, capTop = true, capBot = false) {
+    const y1 = y0 + h;
+    for (let i = 0; i < segs; i++) {
+      const a0 = (i / segs) * TAU;
+      const a1 = ((i + 1) / segs) * TAU;
+      const c0 = Math.cos(a0), s0 = Math.sin(a0);
+      const c1 = Math.cos(a1), s1 = Math.sin(a1);
+      const b0 = [cx + c0 * r0, y0, cz + s0 * r0];
+      const b1 = [cx + c1 * r0, y0, cz + s1 * r0];
+      const t1 = [cx + c1 * r1, y1, cz + s1 * r1];
+      const t0 = [cx + c0 * r1, y1, cz + s0 * r1];
+      if (r1 > 0.001) {
+        this.quad(b0, b1, t1, t0, col, meta, jitter);
+      } else {
+        this.tri(b0, b1, [cx, y1, cz], col, meta, jitter);
+      }
+      if (capTop && r1 > 0.001) {
+        this.tri([cx, y1, cz], t0, t1, col, meta, jitter);
+      }
+      if (capBot && r0 > 0.001) {
+        this.tri([cx, y0, cz], b1, b0, col, meta, jitter);
+      }
+    }
+  }
+
+  // Tube/beam between two 3D points with radius r0 -> r1
+  beam(p0, p1, r0, r1, segs, col, meta = 0, jitter = 0.02) {
+    let dx = p1[0] - p0[0], dy = p1[1] - p0[1], dz = p1[2] - p0[2];
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-5) return;
+    dx /= len; dy /= len; dz /= len;
+    // Construct orthonormal basis
+    const up = Math.abs(dy) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+    let ux = up[1]*dz - up[2]*dy, uy = up[2]*dx - up[0]*dz, uz = up[0]*dy - up[1]*dx;
+    const ul = Math.hypot(ux, uy, uz) || 1;
+    ux /= ul; uy /= ul; uz /= ul;
+    const vx = dy*uz - dz*uy, vy = dz*ux - dx*uz, vz = dx*uy - dy*ux;
+
+    const ring = (p, r, ang) => {
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      return [
+        p[0] + (ux * ca + vx * sa) * r,
+        p[1] + (uy * ca + vy * sa) * r,
+        p[2] + (uz * ca + vz * sa) * r
+      ];
+    };
+    for (let i = 0; i < segs; i++) {
+      const a0 = (i / segs) * TAU;
+      const a1 = ((i + 1) / segs) * TAU;
+      this.quad(ring(p0, r0, a0), ring(p0, r0, a1), ring(p1, r1, a1), ring(p1, r1, a0), col, meta, jitter);
+    }
+  }
+
+  upload() {
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(this.data), gl.STATIC_DRAW);
+    return { buf, count: this.count };
+  }
+}
+
+// ---------------- Lighting & Atmospheric Constants ----------------
+// Low golden-hour sun nestled in the distant fjord notch
+const SUN_DIR = (() => {
+  const x = -0.17, y = 0.145, z = -0.975;
+  const l = Math.hypot(x, y, z);
+  return [x / l, y / l, z / l];
+})();
+
+// ---------------- Shaders ----------------
+
+// 1. Sky Dome + Sun + Crepuscular Shafts + Subtle Clouds
+const SKY_VS = `
+attribute vec2 aPos;
+varying vec2 vUv;
+void main() {
+  vUv = aPos;
+  gl_Position = vec4(aPos, 0.9999, 1.0);
+}
+`;
+
+const SKY_FS = `
+precision highp float;
+varying vec2 vUv;
+uniform mat4 uInvVP;
+uniform vec3 uCamPos;
+uniform vec3 uSunDir;
+uniform float uTime;
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+    mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x),
+    f.y
+  );
+}
+float fbm2(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) {
+    v += a * vnoise(p);
+    p = p * 2.04 + vec2(1.7, 9.2);
+    a *= 0.5;
+  }
+  return v;
+}
+
+void main() {
+  vec4 farPt = uInvVP * vec4(vUv, 1.0, 1.0);
+  vec3 dir = normalize(farPt.xyz / farPt.w - uCamPos);
+
+  float h = clamp(dir.y, -0.15, 1.0);
+  float sunAmt = max(dot(dir, uSunDir), 0.0);
+
+  // Rich Nordic Golden Hour sky gradient
+  vec3 zenith   = vec3(0.08, 0.13, 0.27);
+  vec3 midSky   = vec3(0.27, 0.25, 0.40);
+  vec3 lowRose  = vec3(0.76, 0.44, 0.36);
+  vec3 horizon  = vec3(0.99, 0.72, 0.42);
+
+  vec3 col = mix(horizon, lowRose, smoothstep(-0.02, 0.14, h));
+  col = mix(col, midSky, smoothstep(0.11, 0.36, h));
+  col = mix(col, zenith, smoothstep(0.32, 0.78, h));
+
+  // Solar Mie scattering & warm golden bloom around sun
+  col += vec3(1.0, 0.64, 0.28) * pow(sunAmt, 4.5) * 0.68;
+  col += vec3(1.0, 0.86, 0.56) * pow(sunAmt, 28.0) * 0.95;
+  // Crisp glowing sun disc
+  float sunDisc = smoothstep(0.9978, 0.9992, sunAmt);
+  col = mix(col, vec3(1.0, 0.97, 0.86) * 1.65, sunDisc);
+
+  // Subtle crepuscular light rays radiating from sun
+  float rayAngle = atan(dir.y - uSunDir.y, dir.x - uSunDir.x);
+  float rays = sin(rayAngle * 9.0 + uTime * 0.08) * 0.5 + 0.5;
+  rays *= sin(rayAngle * 17.0 - uTime * 0.05) * 0.5 + 0.5;
+  float rayMask = pow(sunAmt, 3.5) * smoothstep(-0.04, 0.30, h);
+  col += vec3(1.0, 0.80, 0.48) * rays * rayMask * 0.28;
+
+  // Stylized streaky Nordic clouds lit from below in molten gold
+  if (dir.y > 0.02) {
+    vec2 cloudUv = dir.xz / (dir.y + 0.18) * 0.95;
+    cloudUv.x += uTime * 0.014;
+    cloudUv.y += uTime * 0.008;
+    float c1 = fbm2(cloudUv * vec2(1.4, 2.2));
+    float c2 = fbm2(cloudUv * vec2(2.8, 4.0) + vec2(3.1, -1.4));
+    float cloud = smoothstep(0.47, 0.76, c1 * 0.72 + c2 * 0.35);
+    float fade = smoothstep(0.02, 0.14, dir.y) * smoothstep(0.75, 0.22, dir.y);
+    vec3 cloudShadow = vec3(0.24, 0.22, 0.36);
+    vec3 cloudLit = mix(vec3(0.96, 0.56, 0.38), vec3(1.0, 0.88, 0.62), pow(sunAmt, 2.5));
+    float litFactor = clamp(0.28 + 0.75 * pow(sunAmt, 1.8) + (1.0 - c2) * 0.25, 0.0, 1.0);
+    vec3 cloudCol = mix(cloudShadow, cloudLit, litFactor);
+    col = mix(col, cloudCol, cloud * fade * 0.78);
+  }
+
+  // Horizon mist band
+  float mist = exp(-abs(dir.y - 0.01) * 14.0);
+  col = mix(col, vec3(0.97, 0.72, 0.45), mist * (0.30 + 0.38 * pow(sunAmt, 2.0)));
+
+  // Film tone-mapping
+  col = col / (col + vec3(0.72)) * 1.20;
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+// 2. Main Low-Poly World & Ship Shader
+const SOLID_VS = `
+attribute vec3 aPos;
+attribute vec3 aNorm;
+attribute vec3 aCol;
+attribute float aMeta;
+
+uniform mat4 uVP;
+uniform mat4 uModel;
+uniform vec3 uOffset;
+
+varying vec3 vWorldPos;
+varying vec3 vNorm;
+varying vec3 vCol;
+varying float vMeta;
+
+void main() {
+  vec4 wp = uModel * vec4(aPos, 1.0);
+  wp.xyz += uOffset;
+  vWorldPos = wp.xyz;
+  vNorm = normalize(mat3(uModel) * aNorm);
+  vCol = aCol;
+  vMeta = aMeta;
+  gl_Position = uVP * wp;
+}
+`;
+
+const SOLID_FS = `
+precision highp float;
+varying vec3 vWorldPos;
+varying vec3 vNorm;
+varying vec3 vCol;
+varying float vMeta;
+
+uniform vec3 uCamPos;
+uniform vec3 uSunDir;
+uniform vec3 uLanternPos;
+uniform float uTime;
+uniform float uFogScale;
+
+void main() {
+  vec3 N = normalize(vNorm);
+  vec3 V = normalize(uCamPos - vWorldPos);
+  vec3 L = normalize(uSunDir);
+
+  // Warm key sun + cool Nordic sky hemisphere + front-quarter golden bounce
+  float ndl = max(dot(N, L), 0.0);
+  vec3 fillDir = normalize(vec3(0.55, 0.62, 0.56));
+  float fill = max(dot(N, fillDir), 0.0);
+
+  // Rim light along edges facing the sun
+  float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0) * max(dot(N, L) * 0.5 + 0.5, 0.0);
+
+  // Hemisphere ambient (cool twilight sky top, deep teal fjord water bounce below)
+  vec3 hemi = mix(vec3(0.11, 0.21, 0.30), vec3(0.40, 0.47, 0.65), N.y * 0.5 + 0.5);
+
+  vec3 sunCol  = vec3(1.00, 0.77, 0.47);
+  vec3 fillCol = vec3(0.62, 0.56, 0.64);
+
+  vec3 lit = vCol * (hemi * 0.72 + sunCol * ndl * 0.95 + fillCol * fill * 0.38);
+
+  // Material-specific highlights
+  vec3 H = normalize(L + V);
+  vec3 Hfill = normalize(fillDir + V);
+  if (vMeta > 0.18 && vMeta < 0.35) {
+    // Varnished wood / shields
+    float spec = pow(max(dot(N, H), 0.0), 28.0) * 0.35 + pow(max(dot(N, Hfill), 0.0), 20.0) * 0.18;
+    lit += sunCol * spec;
+  } else if (vMeta >= 0.35 && vMeta < 0.65) {
+    // Gilded bronze / iron shield bosses
+    float spec = pow(max(dot(N, H), 0.0), 42.0) * 0.85 + pow(max(dot(N, Hfill), 0.0), 28.0) * 0.45;
+    lit += vec3(1.0, 0.86, 0.56) * spec;
+  } else if (vMeta >= 0.65 && vMeta < 0.9) {
+    // Crisp snow facets
+    float spec = pow(max(dot(N, H), 0.0), 18.0) * 0.28;
+    lit += vec3(1.0, 0.90, 0.78) * spec + vec3(0.10, 0.15, 0.24) * (1.0 - ndl) * 0.35;
+  } else if (vMeta >= 0.9) {
+    // Emissive lantern / shimmering waterfall foam
+    float pulse = 0.92 + 0.08 * sin(uTime * 7.0 + vWorldPos.y * 2.5);
+    lit = vCol * (1.15 * pulse) + sunCol * ndl * 0.2;
+  }
+
+  // Rim highlight
+  lit += vec3(1.0, 0.76, 0.45) * rim * 0.26;
+
+  // Warm local ship lantern glow
+  vec3 toLantern = uLanternPos - vWorldPos;
+  float lDist = length(toLantern);
+  if (lDist < 12.0) {
+    float atten = 1.0 / (1.0 + lDist * lDist * 0.16);
+    float lNdl = max(dot(N, toLantern / max(lDist, 0.001)), 0.15);
+    float flicker = 0.92 + 0.08 * sin(uTime * 11.3) * cos(uTime * 6.7);
+    lit += vCol * vec3(1.0, 0.56, 0.20) * atten * lNdl * 1.15 * flicker;
+  }
+
+  // Atmospheric distance + height fjord mist
+  float dist = length(vWorldPos - uCamPos);
+  float distFog = 1.0 - exp(-pow(dist * 0.0031 * uFogScale, 1.45));
+  // Low-lying valley mist hugging the water surface
+  float valleyMist = exp(-max(vWorldPos.y, 0.0) * 0.075) * smoothstep(35.0, 210.0, dist) * 0.52;
+  float fogAmt = clamp(distFog + valleyMist * (1.0 - distFog), 0.0, 0.96);
+
+  float sunView = max(dot(normalize(vWorldPos - uCamPos), L), 0.0);
+  vec3 fogCool = vec3(0.36, 0.40, 0.53);
+  vec3 fogWarm = vec3(0.95, 0.67, 0.43);
+  vec3 fogCol = mix(fogCool, fogWarm, pow(sunView, 2.2) * 0.85 + 0.15);
+
+  vec3 col = mix(lit, fogCol, fogAmt);
+  // Filmic tone curve
+  col = col / (col + vec3(0.82)) * 1.12;
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+// 3. Animated Billowing Striped Sail + Pennant Shader
+const SAIL_VS = `
+attribute vec3 aPos;
+attribute vec2 aUv;
+attribute vec3 aCol;
+attribute float aFlag; // 0 = main sail, 1 = pennant
+
+uniform mat4 uVP;
+uniform mat4 uModel;
+uniform float uTime;
+
+varying vec3 vWorldPos;
+varying vec3 vNorm;
+varying vec3 vCol;
+varying vec2 vUv;
+varying float vFlag;
+
+void main() {
+  vec3 p = aPos;
+  vec3 n = vec3(0.0, 0.0, 1.0);
+
+  if (aFlag < 0.5) {
+    // Full square sail billowing forward (+Z) in the fjord wind
+    float sx = sin(aUv.x * 3.14159265);
+    float sy = sin(aUv.y * 3.14159265);
+    float gust = 1.0 + 0.11 * sin(uTime * 1.45) + 0.05 * sin(uTime * 2.9 + aUv.x * 3.0);
+    float belly = (1.85 * pow(sy, 0.72) * (0.35 + 0.65 * pow(sx, 0.65))) * gust;
+    // Subtle traveling fabric ripple
+    float ripple = sin(aUv.y * 9.0 - uTime * 4.2 + aUv.x * 4.0) * 0.08 * sy * sx;
+    // Slight inward pull at bottom edges (sheets)
+    p.z += belly + ripple;
+    p.y += 0.18 * (1.0 - sy) * sx;
+
+    // Approximate analytical normal for lighting
+    float dBdX = (aUv.x - 0.5) * -2.2 * sy;
+    float dBdY = (aUv.y - 0.5) * -2.0 * sx;
+    n = normalize(vec3(-dBdX, -dBdY, 1.0));
+  } else {
+    // Masthead swallowtail pennant fluttering toward +Z
+    float t = aUv.x; // 0 at mast, 1 at tail tip
+    float wave = sin(t * 7.5 - uTime * 7.5) * 0.28 * t + sin(t * 14.0 - uTime * 11.0) * 0.08 * t * t;
+    p.x += wave;
+    p.y += cos(t * 5.0 - uTime * 6.0) * 0.07 * t;
+    n = normalize(vec3(1.0, 0.15, -cos(t * 7.5 - uTime * 7.5) * 0.6));
+  }
+
+  vec4 wp = uModel * vec4(p, 1.0);
+  vWorldPos = wp.xyz;
+  vNorm = normalize(mat3(uModel) * n);
+  vCol = aCol;
+  vUv = aUv;
+  vFlag = aFlag;
+  gl_Position = uVP * wp;
+}
+`;
+
+const SAIL_FS = `
+precision highp float;
+varying vec3 vWorldPos;
+varying vec3 vNorm;
+varying vec3 vCol;
+varying vec2 vUv;
+varying float vFlag;
+
+uniform vec3 uCamPos;
+uniform vec3 uSunDir;
+uniform vec3 uLanternPos;
+
+void main() {
+  vec3 N = normalize(vNorm);
+  if (!gl_FrontFacing) N = -N;
+  vec3 V = normalize(uCamPos - vWorldPos);
+  vec3 L = normalize(uSunDir);
+
+  // Subtle stitched seam darkening between stripes & woven linen grain
+  vec3 baseCol = vCol;
+  if (vFlag < 0.5) {
+    float stripeEdge = abs(fract(vUv.x * 7.0 + 0.5) - 0.5);
+    float seam = smoothstep(0.45, 0.5, stripeEdge);
+    baseCol *= (1.0 - seam * 0.16);
+    // Subtle horizontal reefing bands
+    float reef = smoothstep(0.47, 0.5, abs(fract(vUv.y * 4.0) - 0.5));
+    baseCol *= (1.0 - reef * 0.08);
+    // Gentle weathered vignette at very edges
+    float edgeAO = smoothstep(0.0, 0.07, vUv.x) * smoothstep(1.0, 0.93, vUv.x)
+                 * smoothstep(0.0, 0.06, vUv.y) * smoothstep(1.0, 0.94, vUv.y);
+    baseCol *= mix(0.76, 1.0, edgeAO);
+  }
+
+  vec3 fillDir = normalize(vec3(0.55, 0.62, 0.56));
+  float ndlFront = max(dot(N, L), 0.0);
+  float fill = max(dot(N, fillDir), 0.0);
+  // Warm golden subsurface scattering when backlit by the low sun!
+  float backLit = max(dot(-N, L), 0.0);
+  float sunAlign = pow(max(dot(-V, L), 0.0), 2.5);
+  vec3 sss = baseCol * vec3(1.0, 0.66, 0.30) * (backLit * 0.58 + sunAlign * 0.35);
+
+  vec3 hemi = mix(vec3(0.16, 0.25, 0.35), vec3(0.46, 0.50, 0.66), N.y * 0.5 + 0.5);
+  vec3 lit = baseCol * (hemi * 0.68 + vec3(1.0, 0.80, 0.50) * ndlFront * 0.85 + vec3(0.68, 0.60, 0.66) * fill * 0.45) + sss;
+
+  // Warm lantern bounce on lower sail
+  vec3 toLantern = uLanternPos - vWorldPos;
+  float lDist = length(toLantern);
+  lit += baseCol * vec3(1.0, 0.55, 0.20) * (1.0 / (1.0 + lDist * lDist * 0.12)) * 0.55;
+
+  // Subtle distance haze
+  float dist = length(vWorldPos - uCamPos);
+  float fogAmt = clamp(1.0 - exp(-pow(dist * 0.0031, 1.45)), 0.0, 0.9);
+  vec3 fogCol = vec3(0.78, 0.58, 0.46);
+  vec3 col = mix(lit, fogCol, fogAmt);
+  col = col / (col + vec3(0.82)) * 1.12;
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+// 4. Synchronized Rowing Oars Shader (16 oars in 1 draw call!)
+const OAR_VS = `
+attribute vec3 aLocalPos;
+attribute vec3 aNorm;
+attribute vec3 aCol;
+attribute vec3 aPivot;
+attribute vec2 aOarMeta; // x = side (-1 left, +1 right), y = oarIndex (0..7)
+
+uniform mat4 uVP;
+uniform mat4 uModel;
+uniform float uRowPhase;
+
+varying vec3 vWorldPos;
+varying vec3 vNorm;
+varying vec3 vCol;
+
+void main() {
+  float side = aOarMeta.x;
+  float idx = aOarMeta.y;
+  // Tiny organic phase wave from bow to stern so rowers feel alive yet synchronized
+  float ph = uRowPhase - idx * 0.095;
+
+  // Elliptical rowing stroke:
+  // Sweep angle (yaw): positive pulls blade aft (-Z) while in water
+  float sweep = sin(ph) * 0.46;
+  // Dip angle (roll): dips blade into water during power stroke, lifts & feathers on recovery
+  float dip = -0.24 - cos(ph) * 0.21;
+
+  // Local oar extends along +X * side
+  vec3 p = aLocalPos;
+  vec3 n = aNorm;
+
+  // Rotate around Z (dip) then around Y (sweep)
+  float cd = cos(dip * side), sd = sin(dip * side);
+  vec3 p1 = vec3(p.x * cd - p.y * sd, p.x * sd + p.y * cd, p.z);
+  vec3 n1 = vec3(n.x * cd - n.y * sd, n.x * sd + n.y * cd, n.z);
+
+  float cs = cos(sweep * side), ss = sin(sweep * side);
+  vec3 p2 = vec3(p1.x * cs + p1.z * ss, p1.y, -p1.x * ss + p1.z * cs);
+  vec3 n2 = vec3(n1.x * cs + n1.z * ss, n1.y, -n1.x * ss + n1.z * cs);
+
+  vec4 wp = uModel * vec4(aPivot + p2, 1.0);
+  vWorldPos = wp.xyz;
+  vNorm = normalize(mat3(uModel) * n2);
+  vCol = aCol;
+  gl_Position = uVP * wp;
+}
+`;
+
+const OAR_FS = `
+precision highp float;
+varying vec3 vWorldPos;
+varying vec3 vNorm;
+varying vec3 vCol;
+uniform vec3 uCamPos;
+uniform vec3 uSunDir;
+
+void main() {
+  vec3 N = normalize(vNorm);
+  vec3 L = normalize(uSunDir);
+  vec3 V = normalize(uCamPos - vWorldPos);
+  vec3 fillDir = normalize(vec3(0.55, 0.62, 0.56));
+  float ndl = max(dot(N, L), 0.0);
+  float fill = max(dot(N, fillDir), 0.0);
+  vec3 hemi = mix(vec3(0.12, 0.22, 0.30), vec3(0.42, 0.48, 0.64), N.y * 0.5 + 0.5);
+  vec3 lit = vCol * (hemi * 0.72 + vec3(1.0, 0.78, 0.48) * ndl * 0.92 + vec3(0.62, 0.56, 0.64) * fill * 0.42);
+  // Wet sheen near oar blade
+  float wetness = smoothstep(0.6, -0.2, vWorldPos.y);
+  vec3 H = normalize(L + V);
+  lit += vec3(1.0, 0.84, 0.58) * pow(max(dot(N, H), 0.0), 32.0) * (0.25 + 0.6 * wetness);
+  lit = lit / (lit + vec3(0.82)) * 1.12;
+  gl_FragColor = vec4(lit, 1.0);
+}
+`;
+
+// 5. Animated Faceted Fjord Water + Reflections + Kelvin V-Wake + Oar Splashes
+const WATER_VS = `
+attribute vec2 aXZ;
+uniform mat4 uVP;
+uniform float uTime;
+uniform float uWorldZ;
+
+varying vec3 vWorldPos;
+varying vec3 vSmoothNorm;
+varying float vWaveH;
+
+float waveHeight(vec2 p, float t) {
+  float h = 0.0;
+  h += sin(p.x * 0.24 + p.y * 0.16 + t * 1.55) * 0.24;
+  h += sin(p.x * -0.19 + p.y * 0.31 + t * 1.95) * 0.16;
+  h += sin(p.x * 0.52 - p.y * 0.44 + t * 2.65) * 0.075;
+  h += cos(p.x * 0.85 + p.y * 0.72 - t * 3.10) * 0.038;
+  return h;
+}
+
+void main() {
+  // Sample waves in scrolling world coordinates so water rushes continuously past the ship!
+  vec2 wp = vec2(aXZ.x, aXZ.y + uWorldZ);
+  float h = waveHeight(wp, uTime);
+
+  // Add subtle Kelvin wake elevation right behind the ship
+  float zBehind = 7.8 - aXZ.y;
+  if (zBehind > 0.0 && zBehind < 75.0) {
+    float armX = 1.55 + zBehind * 0.235;
+    float dArm = abs(abs(aXZ.x) - armX);
+    float armWave = exp(-dArm * dArm * 0.65) * sin(dArm * 3.4 - uTime * 5.0) * 0.20 * exp(-zBehind * 0.025);
+    h += armWave;
+  }
+
+  vec3 pos = vec3(aXZ.x, h, aXZ.y);
+  vWorldPos = pos;
+  vWaveH = h;
+
+  // Fallback analytical normal if OES_standard_derivatives unavailable
+  float eps = 0.35;
+  float hx = waveHeight(wp + vec2(eps, 0.0), uTime) - h;
+  float hz = waveHeight(wp + vec2(0.0, eps), uTime) - h;
+  vSmoothNorm = normalize(vec3(-hx, eps, -hz));
+
+  gl_Position = uVP * vec4(pos, 1.0);
+}
+`;
+
+const WATER_FS = `
+${HAS_DERIV ? '#extension GL_OES_standard_derivatives : enable' : ''}
+precision highp float;
+varying vec3 vWorldPos;
+varying vec3 vSmoothNorm;
+varying float vWaveH;
+
+uniform vec3 uCamPos;
+uniform vec3 uSunDir;
+uniform float uTime;
+uniform float uWorldZ;
+uniform float uRowPhase;
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+    mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x),
+    f.y
+  );
+}
+
+void main() {
+  // Razor-sharp low-poly faceted water normals!
+  ${HAS_DERIV
+    ? 'vec3 flatN = normalize(cross(dFdx(vWorldPos), dFdy(vWorldPos))); vec3 N = normalize(mix(flatN, normalize(vSmoothNorm), 0.14));'
+    : 'vec3 N = normalize(vSmoothNorm);'}
+
+  vec3 V = normalize(uCamPos - vWorldPos);
+  vec3 L = normalize(uSunDir);
+
+  // Deep cold Nordic fjord water palette
+  vec3 deepCol  = vec3(0.03, 0.09, 0.15);
+  vec3 midCol   = vec3(0.06, 0.17, 0.24);
+  vec3 crestCol = vec3(0.11, 0.26, 0.33);
+  vec3 baseCol = mix(deepCol, midCol, smoothstep(-0.28, 0.22, vWaveH));
+  baseCol = mix(baseCol, crestCol, smoothstep(0.16, 0.42, vWaveH));
+
+  // Fresnel reflection of golden-hour sky & fjord walls
+  float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.6);
+  vec3 R = reflect(-V, N);
+  float sunRefl = max(dot(R, L), 0.0);
+
+  vec3 skyRefl = mix(vec3(0.16, 0.22, 0.34), vec3(0.95, 0.65, 0.38), pow(sunRefl, 2.2) * 0.85 + 0.15);
+  vec3 col = mix(baseCol, skyRefl, clamp(fresnel * 0.72 + 0.10, 0.0, 0.86));
+
+  // Glistening golden sun-glitter path across the dark facets
+  vec3 H = normalize(L + V);
+  float specBroad = pow(max(dot(N, H), 0.0), 28.0) * 0.48;
+  float specSharp = pow(max(dot(N, H), 0.0), 190.0) * 2.2;
+  col += vec3(1.0, 0.78, 0.42) * specBroad + vec3(1.0, 0.94, 0.76) * specSharp;
+
+  // -------- Ship Bow Wave, Hull Foam & Trailing Kelvin V-Wake --------
+  float sx = abs(vWorldPos.x);
+  float sz = vWorldPos.z;
+  float foam = 0.0;
+
+  // Scrolling foam texture noise
+  vec2 flowUv = vec2(vWorldPos.x * 0.65, (vWorldPos.z + uWorldZ) * 0.65);
+  float fNoise = vnoise(flowUv * 1.4) * 0.65 + vnoise(flowUv * 3.1 + vec2(4.2, -1.7)) * 0.35;
+
+  // 1. Bow wave & hull waterline froth
+  if (sz > -9.0 && sz < 9.5 && sx < 5.0) {
+    float u = clamp(sz / 8.5, -1.0, 1.0);
+    float hullW = 2.12 * pow(max(0.0, 1.0 - u * u), 0.72);
+    float dHull = sx - hullW;
+    // Frothy ribbon hugging the hull sides
+    float hullFoam = exp(-pow((dHull - 0.18) / 0.55, 2.0)) * smoothstep(-8.8, -5.0, sz) * smoothstep(9.2, 7.6, sz);
+    // Bright curling bow splash at prow
+    float bowDist = length(vec2(sx * 1.15, (sz - 8.1) * 0.8));
+    float bowFoam = exp(-bowDist * bowDist * 0.55) * 1.25;
+    foam += (hullFoam * 0.65 + bowFoam) * (0.55 + 0.65 * fNoise);
+  }
+
+  // 2. Expanding V-shaped Kelvin wake trailing behind the ship (-Z)
+  float zBehind = 7.6 - sz;
+  if (zBehind > 0.0 && zBehind < 95.0) {
+    float armX = 1.45 + zBehind * 0.245;
+    float armWidth = 0.65 + zBehind * 0.045;
+    float dArm = abs(sx - armX);
+    float armMask = exp(-pow(dArm / armWidth, 2.0));
+    float chevrons = 0.55 + 0.45 * sin(dArm * 2.8 - zBehind * 0.55 - uTime * 3.8);
+    float fade = exp(-zBehind * 0.022) * smoothstep(0.0, 2.5, zBehind);
+    foam += armMask * chevrons * fade * (0.48 + 0.72 * fNoise) * 0.95;
+
+    // Secondary inner wake ripple
+    float armX2 = 0.7 + zBehind * 0.135;
+    float dArm2 = abs(sx - armX2);
+    float armMask2 = exp(-pow(dArm2 / (armWidth * 0.8), 2.0));
+    foam += armMask2 * fade * (0.35 + 0.65 * fNoise) * 0.42;
+
+    // Central turbulent stern wash
+    if (sz < -6.5) {
+      float sternDist = -6.5 - sz;
+      float washW = 1.25 + sternDist * 0.045;
+      float wash = exp(-pow(sx / washW, 2.0)) * exp(-sternDist * 0.042);
+      foam += wash * smoothstep(0.32, 0.78, fNoise) * 0.78;
+    }
+  }
+
+  // 3. Synchronized Oar Entry Splash Foam (8 oars per side)
+  if (sz > -5.5 && sz < 5.5 && sx > 3.2 && sx < 7.2) {
+    // Oar z-positions span roughly -4.3 to +4.3
+    float oarIdx = clamp(floor((4.75 - sz) / 1.22 + 0.5), 0.0, 7.0);
+    float oarZ = 4.25 - oarIdx * 1.22;
+    float ph = uRowPhase - oarIdx * 0.095;
+    // Blade is in water when cos(ph) > -0.15
+    float inWater = smoothstep(-0.15, 0.35, cos(ph));
+    float bladeZ = oarZ - sin(ph) * 1.85;
+    float bladeX = 5.15;
+    float dOar = length(vec2((sx - bladeX) * 0.95, (sz - bladeZ) * 0.95));
+    float splash = exp(-dOar * dOar * 1.35) * inWater * (0.55 + 0.6 * fNoise);
+    foam += splash * 0.95;
+  }
+
+  // Subtle ambient whitecaps on tallest wave crests
+  foam += smoothstep(0.33, 0.48, vWaveH) * fNoise * 0.16;
+
+  // Blend sunlit warm-cream sea foam
+  foam = clamp(foam, 0.0, 1.0);
+  vec3 foamCol = mix(vec3(0.74, 0.82, 0.87), vec3(1.0, 0.91, 0.78), 0.45 + 0.4 * pow(max(dot(V, -L), 0.0), 2.0));
+  col = mix(col, foamCol, foam * 0.86);
+
+  // Atmospheric fjord fog
+  float dist = length(vWorldPos - uCamPos);
+  float fogAmt = clamp(1.0 - exp(-pow(dist * 0.0031, 1.45)), 0.0, 0.96);
+  float sunView = max(dot(normalize(vWorldPos - uCamPos), L), 0.0);
+  vec3 fogCol = mix(vec3(0.36, 0.40, 0.53), vec3(0.95, 0.67, 0.43), pow(sunView, 2.2) * 0.85 + 0.15);
+  col = mix(col, fogCol, fogAmt);
+
+  col = col / (col + vec3(0.82)) * 1.12;
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+// 6. Soft Atmospheric Motes / Bow Spray / Mist Particles Shader
+const PARTICLE_VS = `
+attribute vec3 aPos;
+attribute vec4 aCol;
+attribute float aSize;
+
+uniform mat4 uVP;
+uniform float uPixelRatio;
+
+varying vec4 vCol;
+
+void main() {
+  vec4 clip = uVP * vec4(aPos, 1.0);
+  vCol = aCol;
+  gl_Position = clip;
+  gl_PointSize = clamp(aSize * uPixelRatio * (180.0 / max(clip.w, 1.0)), 1.5, 42.0);
+}
+`;
+
+const PARTICLE_FS = `
+precision mediump float;
+varying vec4 vCol;
+void main() {
+  vec2 d = gl_PointCoord - 0.5;
+  float r = length(d) * 2.0;
+  if (r > 1.0) discard;
+  float soft = pow(1.0 - r, 1.8);
+  gl_FragColor = vec4(vCol.rgb, vCol.a * soft);
+}
+`;
+
+// Compile all programs
+const progSky      = createProgram(SKY_VS, SKY_FS);
+const progSolid    = createProgram(SOLID_VS, SOLID_FS);
+const progSail     = createProgram(SAIL_VS, SAIL_FS);
+const progOar      = createProgram(OAR_VS, OAR_FS);
+const progWater    = createProgram(WATER_VS, WATER_FS);
+const progParticle = createProgram(PARTICLE_VS, PARTICLE_FS);
+
+// Cache uniform & attribute locations
+function getLocs(prog, attrs, unifs) {
+  const o = { a: {}, u: {} };
+  for (const k of attrs) o.a[k] = gl.getAttribLocation(prog, k);
+  for (const k of unifs) o.u[k] = gl.getUniformLocation(prog, k);
+  return o;
+}
+
+const locSky = getLocs(progSky, ['aPos'], ['uInvVP', 'uCamPos', 'uSunDir', 'uTime']);
+const locSolid = getLocs(progSolid, ['aPos', 'aNorm', 'aCol', 'aMeta'], ['uVP', 'uModel', 'uOffset', 'uCamPos', 'uSunDir', 'uLanternPos', 'uTime', 'uFogScale']);
+const locSail = getLocs(progSail, ['aPos', 'aUv', 'aCol', 'aFlag'], ['uVP', 'uModel', 'uTime', 'uCamPos', 'uSunDir', 'uLanternPos']);
+const locOar = getLocs(progOar, ['aLocalPos', 'aNorm', 'aCol', 'aPivot', 'aOarMeta'], ['uVP', 'uModel', 'uRowPhase', 'uCamPos', 'uSunDir']);
+const locWater = getLocs(progWater, ['aXZ'], ['uVP', 'uTime', 'uWorldZ', 'uCamPos', 'uSunDir', 'uRowPhase']);
+const locPart = getLocs(progParticle, ['aPos', 'aCol', 'aSize'], ['uVP', 'uPixelRatio']);
+
+// ---------------- Geometry Generation ----------------
+
+// 1. Sky Quad
+const skyBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, skyBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+
+// 2. Hero Viking Longship Geometry
+function hullHalfW(u) {
+  return 2.15 * Math.pow(Math.max(0, 1 - u * u), 0.72);
+}
+function hullGunwaleY(u) {
+  return 0.96 + 1.48 * Math.pow(Math.abs(u), 2.35);
+}
+function hullKeelY(u) {
+  return -0.82 + 1.62 * Math.pow(Math.abs(u), 2.75);
+}
+
+function buildVikingShip() {
+  const mb = new MeshBuilder();
+  const L = 8.5; // half-length -> 17 units total
+  const zSegs = 22;
+  const strakes = 5;
+
+  // Color palette (rich tarred oak, warm cedar planks, gilded trim)
+  const darkTar  = [0.16, 0.11, 0.08];
+  const midOak   = [0.30, 0.19, 0.12];
+  const warmOak  = [0.42, 0.27, 0.16];
+  const deckWood = [0.35, 0.23, 0.14];
+  const goldTrim = [0.85, 0.64, 0.24];
+  const darkIron = [0.24, 0.26, 0.30];
+
+  // Outer clinker-built hull strakes (subtle voxel-stepped overlap!)
+  for (let side of [-1, 1]) {
+    for (let i = 0; i < zSegs; i++) {
+      const u0 = -1 + (2 * i) / zSegs;
+      const u1 = -1 + (2 * (i + 1)) / zSegs;
+      const z0 = u0 * L, z1 = u1 * L;
+      const w0 = hullHalfW(u0), w1 = hullHalfW(u1);
+      const ky0 = hullKeelY(u0), ky1 = hullKeelY(u1);
+      const gy0 = hullGunwaleY(u0), gy1 = hullGunwaleY(u1);
+
+      for (let s = 0; s < strakes; s++) {
+        const t0 = s / strakes;
+        const t1 = (s + 1) / strakes;
+        // Curved cross-section + clinker lap step
+        const shape = t => Math.pow(t, 0.56);
+        const stepOut = s * 0.028;
+        const x00 = side * (w0 * shape(t0) + stepOut * (1 - u0 * u0 * 0.7));
+        const x01 = side * (w0 * shape(t1) + (stepOut + 0.045) * (1 - u0 * u0 * 0.7));
+        const x10 = side * (w1 * shape(t0) + stepOut * (1 - u1 * u1 * 0.7));
+        const x11 = side * (w1 * shape(t1) + (stepOut + 0.045) * (1 - u1 * u1 * 0.7));
+
+        const y00 = lerp(ky0, gy0, t0), y01 = lerp(ky0, gy0, t1);
+        const y10 = lerp(ky1, gy1, t0), y11 = lerp(ky1, gy1, t1);
+
+        const col = s === 0 ? darkTar : (s === strakes - 1 ? warmOak : (s % 2 === 0 ? midOak : [0.35, 0.22, 0.14]));
+        const pA = [x00, y00, z0], pB = [x10, y10, z1], pC = [x11, y11, z1], pD = [x01, y01, z0];
+        if (side > 0) mb.quad(pA, pD, pC, pB, col, 0.25, 0.018);
+        else          mb.quad(pA, pB, pC, pD, col, 0.25, 0.018);
+      }
+
+      // Inner hull wall + thick gunwale rail cap
+      const gw0 = w0 + 0.12 * (1 - u0 * u0 * 0.7);
+      const gw1 = w1 + 0.12 * (1 - u1 * u1 * 0.7);
+      const iw0 = Math.max(0, w0 - 0.14);
+      const iw1 = Math.max(0, w1 - 0.14);
+      const capA = [side * gw0, gy0 + 0.06, z0], capB = [side * gw1, gy1 + 0.06, z1];
+      const capC = [side * iw1, gy1 + 0.06, z1], capD = [side * iw0, gy0 + 0.06, z0];
+      if (side > 0) mb.quad(capA, capD, capC, capB, warmOak, 0.25, 0.015);
+      else          mb.quad(capA, capB, capC, capD, warmOak, 0.25, 0.015);
+
+      // Gilded trim stripe along upper gunwale
+      const gA = [side * (gw0 + 0.03), gy0 - 0.05, z0], gB = [side * (gw1 + 0.03), gy1 - 0.05, z1];
+      const gC = [side * (gw1 + 0.03), gy1 + 0.05, z1], gD = [side * (gw0 + 0.03), gy0 + 0.05, z0];
+      if (side > 0) mb.quad(gA, gD, gC, gB, goldTrim, 0.5, 0.01);
+      else          mb.quad(gA, gB, gC, gD, goldTrim, 0.5, 0.01);
+
+      // Inner hull lining down to deck
+      const dy = 0.24;
+      const inA = [side * iw0, gy0 + 0.05, z0], inB = [side * iw1, gy1 + 0.05, z1];
+      const inC = [side * iw1 * 0.72, Math.max(dy, ky1 + 0.3), z1], inD = [side * iw0 * 0.72, Math.max(dy, ky0 + 0.3), z0];
+      if (side > 0) mb.quad(inA, inB, inC, inD, darkTar, 0.0, 0.015);
+      else          mb.quad(inA, inD, inC, inB, darkTar, 0.0, 0.015);
+    }
+  }
+
+  // Deck planking & rowing thwarts (benches)
+  for (let i = 1; i < zSegs - 1; i++) {
+    const u0 = -1 + (2 * i) / zSegs;
+    const u1 = -1 + (2 * (i + 1)) / zSegs;
+    const z0 = u0 * L, z1 = u1 * L;
+    const w0 = hullHalfW(u0) * 0.82, w1 = hullHalfW(u1) * 0.82;
+    const y0 = 0.34 + 0.55 * Math.pow(Math.abs(u0), 3.0);
+    const y1 = 0.34 + 0.55 * Math.pow(Math.abs(u1), 3.0);
+    mb.quad([-w0, y0, z0], [w0, y0, z0], [w1, y1, z1], [-w1, y1, z1], deckWood, 0.0, 0.02);
+  }
+
+  // Rowing benches (8 thwarts) + stylized low-poly Viking rowers!
+  const cloakCols = [[0.46, 0.16, 0.14], [0.16, 0.26, 0.34], [0.34, 0.28, 0.20], [0.22, 0.30, 0.22]];
+  for (let r = 0; r < 8; r++) {
+    const z = 4.25 - r * 1.22;
+    const u = z / L;
+    const hw = hullHalfW(u) * 0.85;
+    mb.box(0, 0.62, z, hw, 0.07, 0.16, midOak, 0.0);
+
+    // Subtle low-poly Viking rowers on port & starboard (gives instant human scale!)
+    for (let side of [-1, 1]) {
+      const rx = side * (hw * 0.54);
+      const cloak = cloakCols[(r + (side > 0 ? 1 : 0)) % cloakCols.length];
+      // Torso
+      mb.box(rx, 1.05, z - 0.12, 0.21, 0.32, 0.16, cloak, 0.0, 0.14, 0, 0);
+      // Shoulders
+      mb.box(rx, 1.28, z - 0.08, 0.26, 0.11, 0.15, [cloak[0]*0.8, cloak[1]*0.8, cloak[2]*0.8], 0.0);
+      // Head + Nordic spangenhelm
+      mb.box(rx, 1.50, z - 0.06, 0.12, 0.13, 0.12, [0.76, 0.58, 0.45], 0.0);
+      mb.frustum(rx, 1.56, z - 0.06, 0.15, 0.04, 0.16, 6, darkIron, 0.5, 0.02, false);
+    }
+  }
+
+  // Helmsman standing proudly at the stern steering oar
+  mb.box(-0.45, 1.38, -6.2, 0.23, 0.44, 0.18, [0.55, 0.15, 0.13], 0.0);
+  mb.box(-0.45, 1.92, -6.18, 0.13, 0.14, 0.13, [0.78, 0.60, 0.46], 0.0);
+  mb.frustum(-0.45, 2.0, -6.18, 0.16, 0.04, 0.18, 6, goldTrim, 0.5, 0.01, false);
+  // Starboard steering oar (styre)
+  mb.beam([1.28, 1.25, -6.1], [1.95, -0.95, -7.8], 0.09, 0.18, 6, warmOak, 0.25);
+
+  // -------- Bold Sweeping Dragon-Head Prow (+Z) --------
+  const prowPts = [
+    [0, 1.10, 7.6, 0.26, 0.30],
+    [0, 1.95, 8.35, 0.24, 0.30],
+    [0, 2.95, 9.05, 0.22, 0.28],
+    [0, 4.05, 9.55, 0.20, 0.26],
+    [0, 5.05, 9.72, 0.18, 0.24],
+    [0, 5.72, 10.18, 0.22, 0.24]
+  ];
+  for (let i = 0; i < prowPts.length - 1; i++) {
+    const a = prowPts[i], b = prowPts[i + 1];
+    mb.beam([a[0], a[1], a[2]], [b[0], b[1], b[2]], a[3], b[3], 6, darkTar, 0.25);
+    // Voxel-stepped golden dorsal mane spikes along neck!
+    if (i >= 1) {
+      const mx = 0, my = (a[1] + b[1]) * 0.5 + 0.08, mz = (a[2] + b[2]) * 0.5 - 0.24;
+      mb.box(mx, my, mz, 0.07, 0.22, 0.18, goldTrim, 0.5, -0.35, 0, 0);
+    }
+  }
+  // Sculpted Dragon Head at (0, 5.75, 10.35)
+  const dhY = 5.75, dhZ = 10.35;
+  // Cranium
+  mb.box(0, dhY + 0.08, dhZ, 0.30, 0.30, 0.42, darkTar, 0.25, -0.15, 0, 0);
+  // Upper snarling snout
+  mb.box(0, dhY + 0.02, dhZ + 0.58, 0.22, 0.18, 0.45, midOak, 0.25, -0.06, 0, 0);
+  mb.box(0, dhY + 0.14, dhZ + 0.94, 0.16, 0.14, 0.16, goldTrim, 0.5, 0.2, 0, 0); // upturned nostril curl
+  // Open lower jaw
+  mb.box(0, dhY - 0.34, dhZ + 0.48, 0.18, 0.11, 0.40, darkTar, 0.25, 0.38, 0, 0);
+  // Crimson dragon tongue
+  mb.box(0, dhY - 0.18, dhZ + 0.62, 0.06, 0.04, 0.32, [0.85, 0.16, 0.14], 0.25, 0.18, 0, 0);
+  // White fangs
+  for (let side of [-1, 1]) {
+    mb.frustum(side * 0.14, dhY - 0.18, dhZ + 0.78, 0.04, 0.005, 0.14, 4, [0.95, 0.92, 0.82], 0.0);
+    // Glowing golden-amber eyes
+    mb.box(side * 0.28, dhY + 0.16, dhZ + 0.16, 0.06, 0.08, 0.10, [1.0, 0.78, 0.22], 1.0);
+    // Swept-back sculpted horns
+    mb.beam([side * 0.22, dhY + 0.28, dhZ - 0.10], [side * 0.52, dhY + 0.88, dhZ - 0.72], 0.09, 0.02, 5, goldTrim, 0.5);
+    mb.beam([side * 0.20, dhY + 0.05, dhZ - 0.16], [side * 0.42, dhY + 0.32, dhZ - 0.65], 0.07, 0.02, 5, warmOak, 0.25);
+  }
+
+  // -------- Curled Dragon-Tail Sternpost (-Z) --------
+  const sternPts = [
+    [0, 1.10, -7.6, 0.25],
+    [0, 2.05, -8.35, 0.22],
+    [0, 3.15, -8.95, 0.19],
+    [0, 4.25, -9.20, 0.16],
+    [0, 4.95, -8.85, 0.14],
+    [0, 5.05, -8.25, 0.12],
+    [0, 4.62, -7.95, 0.10],
+    [0, 4.35, -8.25, 0.08]
+  ];
+  for (let i = 0; i < sternPts.length - 1; i++) {
+    const a = sternPts[i], b = sternPts[i + 1];
+    mb.beam([a[0], a[1], a[2]], [b[0], b[1], b[2]], a[3], b[3], 6, i > 4 ? goldTrim : darkTar, i > 4 ? 0.5 : 0.25);
+  }
+
+  // -------- 18 Round Viking Shields Along Both Gunwales --------
+  const shieldSchemes = [
+    [[0.78, 0.16, 0.14], [0.92, 0.87, 0.76]], // Crimson & Bone
+    [[0.14, 0.34, 0.48], [0.90, 0.72, 0.26]], // Nordic Blue & Gold
+    [[0.82, 0.44, 0.14], [0.16, 0.18, 0.22]], // Ochre & Charcoal
+    [[0.18, 0.38, 0.24], [0.92, 0.87, 0.76]], // Pine Green & Bone
+  ];
+  const shieldCount = 9;
+  for (let side of [-1, 1]) {
+    for (let i = 0; i < shieldCount; i++) {
+      const u = -0.58 + (1.16 * i) / (shieldCount - 1);
+      const z = u * L;
+      const hw = hullHalfW(u) + 0.22;
+      const y = hullGunwaleY(u) + 0.12;
+      const cx = side * hw;
+      const R = 0.53;
+      const segs = 12;
+      const [cA, cB] = shieldSchemes[(i + (side > 0 ? 0 : 2)) % shieldSchemes.length];
+
+      // Build faceted round shield facing outward (+/- X)
+      const tilt = side * 0.12;
+      const centerFront = [cx + side * 0.07, y, z];
+      const centerBack  = [cx - side * 0.05, y, z];
+      for (let s = 0; s < segs; s++) {
+        const a0 = (s / segs) * TAU;
+        const a1 = ((s + 1) / segs) * TAU;
+        // Quartered heraldry pattern
+        const q = Math.floor((s / segs) * 4);
+        const col = (q % 2 === 0) ? cA : cB;
+
+        const p0 = [cx + side * 0.04 + Math.cos(a0) * tilt * R, y + Math.cos(a0) * R, z + Math.sin(a0) * R];
+        const p1 = [cx + side * 0.04 + Math.cos(a1) * tilt * R, y + Math.cos(a1) * R, z + Math.sin(a1) * R];
+        const b0 = [p0[0] - side * 0.08, p0[1], p0[2]];
+        const b1 = [p1[0] - side * 0.08, p1[1], p1[2]];
+        if (side > 0) {
+          mb.tri(centerFront, p1, p0, col, 0.25, 0.012);
+          mb.quad(p0, p1, b1, b0, darkTar, 0.0, 0.01);
+          mb.tri(centerBack, b0, b1, darkTar, 0.0, 0.01);
+        } else {
+          mb.tri(centerFront, p0, p1, col, 0.25, 0.012);
+          mb.quad(p1, p0, b0, b1, darkTar, 0.0, 0.01);
+          mb.tri(centerBack, b1, b0, darkTar, 0.0, 0.01);
+        }
+      }
+      // Raised metallic iron shield boss (umbo)
+      const bossR = 0.15;
+      const bossTip = [cx + side * 0.19, y, z];
+      for (let s = 0; s < 6; s++) {
+        const a0 = (s / 6) * TAU, a1 = ((s + 1) / 6) * TAU;
+        const bp0 = [cx + side * 0.07, y + Math.cos(a0) * bossR, z + Math.sin(a0) * bossR];
+        const bp1 = [cx + side * 0.07, y + Math.cos(a1) * bossR, z + Math.sin(a1) * bossR];
+        if (side > 0) mb.tri(bossTip, bp1, bp0, goldTrim, 0.5, 0.01);
+        else          mb.tri(bossTip, bp0, bp1, goldTrim, 0.5, 0.01);
+      }
+    }
+  }
+
+  // -------- Central Mast, Yardarm, Rigging & Warm Prow Lantern --------
+  const mastZ = 0.45;
+  // Mast base partner block
+  mb.box(0, 0.65, mastZ, 0.42, 0.25, 0.58, darkTar, 0.0);
+  // Tall tapered spruce mast
+  mb.frustum(0, 0.4, mastZ, 0.21, 0.11, 11.1, 8, warmOak, 0.25, 0.015);
+  // Gilded masthead finial + wind-vane bracket
+  mb.box(0, 11.6, mastZ, 0.14, 0.26, 0.14, goldTrim, 0.5);
+
+  // Horizontal Yardarm (slightly angled for wind drama)
+  const yardY = 9.45;
+  const yardHalf = 4.55;
+  mb.beam([-yardHalf, yardY, mastZ + 0.24], [yardHalf, yardY, mastZ + 0.24], 0.11, 0.08, 7, warmOak, 0.25);
+
+  // Taut Rigging Lines (forestay, backstay, shrouds, sail sheets)
+  const ropeCol = [0.22, 0.18, 0.14];
+  mb.beam([0, 10.6, mastZ], [0, 3.1, 8.9], 0.032, 0.032, 4, ropeCol, 0);
+  mb.beam([0, 10.6, mastZ], [0, 3.3, -8.8], 0.032, 0.032, 4, ropeCol, 0);
+  for (let side of [-1, 1]) {
+    // 3 shrouds per side
+    mb.beam([0, 10.3, mastZ], [side * 2.08, 1.08, mastZ - 0.9], 0.026, 0.026, 4, ropeCol, 0);
+    mb.beam([0, 10.3, mastZ], [side * 2.12, 1.05, mastZ - 0.2], 0.026, 0.026, 4, ropeCol, 0);
+    mb.beam([0, 10.3, mastZ], [side * 2.06, 1.08, mastZ + 0.6], 0.026, 0.026, 4, ropeCol, 0);
+    // Yard lifts
+    mb.beam([0, 11.0, mastZ], [side * 4.1, yardY, mastZ + 0.24], 0.022, 0.022, 4, ropeCol, 0);
+    // Lower sail sheets
+    mb.beam([side * 4.1, 2.95, mastZ + 0.55], [side * 1.95, 1.15, -2.5], 0.024, 0.024, 4, ropeCol, 0);
+  }
+
+  // Glowing iron-caged fire lantern hung forward of the mast
+  mb.beam([0, 2.3, 4.9], [0, 2.65, 5.45], 0.045, 0.045, 4, darkIron, 0.5);
+  mb.box(0, 2.38, 5.45, 0.18, 0.22, 0.18, [1.0, 0.72, 0.26], 1.0); // glowing flame core
+  mb.box(0, 2.64, 5.45, 0.24, 0.05, 0.24, darkIron, 0.5); // lantern cap
+
+  return mb.upload();
+}
+
+// 3. Billowing Square Striped Sail + Swallowtail Masthead Pennant
+function buildSailAndPennant() {
+  // Stride = 9 floats: px, py, pz, u, v, r, g, b, flag
+  const data = [];
+  let count = 0;
+  const pushV = (p, uv, c, flag) => {
+    data.push(p[0], p[1], p[2], uv[0], uv[1], c[0], c[1], c[2], flag);
+    count++;
+  };
+
+  const cols = 14, rows = 10;
+  const sailW = 8.4, topY = 9.38, botY = 2.95, zBase = 0.72;
+  const crimson = [0.76, 0.17, 0.14];
+  const cream   = [0.95, 0.89, 0.77];
+
+  for (let iy = 0; iy < rows; iy++) {
+    for (let ix = 0; ix < cols; ix++) {
+      const u0 = ix / cols, u1 = (ix + 1) / cols;
+      const v0 = iy / rows, v1 = (iy + 1) / rows;
+      // 7 crisp vertical stripes (2 grid columns per stripe!)
+      const stripeIdx = Math.floor(ix / 2);
+      const col = (stripeIdx % 2 === 0) ? crimson : cream;
+
+      // Slight graceful arch at bottom edge of sail
+      const pt = (u, v) => {
+        const arch = Math.sin(u * Math.PI) * 0.42 * (1 - v);
+        const taper = 1.0 + 0.03 * (1 - v);
+        return [(u - 0.5) * sailW * taper, lerp(botY + arch, topY, v), zBase];
+      };
+      const a = pt(u0, v0), b = pt(u1, v0), c = pt(u1, v1), d = pt(u0, v1);
+      pushV(a, [u0, v0], col, 0); pushV(b, [u1, v0], col, 0); pushV(c, [u1, v1], col, 0);
+      pushV(a, [u0, v0], col, 0); pushV(c, [u1, v1], col, 0); pushV(d, [u0, v1], col, 0);
+    }
+  }
+
+  // Crimson & gold swallowtail pennant at masthead streaming forward (+Z)
+  const pSegs = 8;
+  const pLen = 2.9;
+  for (let i = 0; i < pSegs; i++) {
+    const t0 = i / pSegs, t1 = (i + 1) / pSegs;
+    const h0 = lerp(0.32, 0.08, t0);
+    const h1 = lerp(0.32, 0.08, t1);
+    const col = i < 2 ? [0.90, 0.68, 0.24] : crimson;
+    const z0 = 0.55 + t0 * pLen, z1 = 0.55 + t1 * pLen;
+    const yC = 11.28;
+    const a = [0, yC - h0, z0], b = [0, yC - h1, z1], c = [0, yC + h1, z1], d = [0, yC + h0, z0];
+    pushV(a, [t0, 0], col, 1); pushV(b, [t1, 0], col, 1); pushV(c, [t1, 1], col, 1);
+    pushV(a, [t0, 0], col, 1); pushV(c, [t1, 1], col, 1); pushV(d, [t0, 1], col, 1);
+  }
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+  return { buf, count };
+}
+
+// 4. 16 Synchronized Rowing Oars (Batched into 1 buffer)
+function buildOars() {
+  // Stride = 14 floats: lx,ly,lz, nx,ny,nz, r,g,b, px,py,pz, side, idx
+  const data = [];
+  let count = 0;
+
+  function addOarTri(a, b, c, col, pivot, side, idx) {
+    const ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+    const vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+    let nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    nx /= l; ny /= l; nz /= l;
+    for (const p of [a, b, c]) {
+      data.push(p[0], p[1], p[2], nx, ny, nz, col[0], col[1], col[2], pivot[0], pivot[1], pivot[2], side, idx);
+    }
+    count += 3;
+  }
+
+  function addOarBox(x0, x1, hy0, hz0, hy1, hz1, col, pivot, side, idx) {
+    const sx0 = x0 * side, sx1 = x1 * side;
+    const p000 = [sx0, -hy0, -hz0], p010 = [sx0, hy0, -hz0], p011 = [sx0, hy0, hz0], p001 = [sx0, -hy0, hz0];
+    const p100 = [sx1, -hy1, -hz1], p110 = [sx1, hy1, -hz1], p111 = [sx1, hy1, hz1], p101 = [sx1, -hy1, hz1];
+    const q = (a, b, c, d) => {
+      if (side > 0) { addOarTri(a, b, c, col, pivot, side, idx); addOarTri(a, c, d, col, pivot, side, idx); }
+      else          { addOarTri(a, c, b, col, pivot, side, idx); addOarTri(a, d, c, col, pivot, side, idx); }
+    };
+    q(p001, p101, p111, p011);
+    q(p100, p000, p010, p110);
+    q(p011, p111, p110, p010);
+    q(p000, p100, p101, p001);
+    q(p101, p100, p110, p111);
+  }
+
+  const L = 8.5;
+  const shaftCol = [0.56, 0.39, 0.22];
+  const bladeCol = [0.46, 0.28, 0.16];
+  const bandCol  = [0.76, 0.20, 0.16];
+
+  for (let side of [-1, 1]) {
+    for (let i = 0; i < 8; i++) {
+      const z = 4.25 - i * 1.22;
+      const u = z / L;
+      const pivot = [side * (hullHalfW(u) - 0.05), hullGunwaleY(u) - 0.15, z];
+      // Inboard handle + long shaft
+      addOarBox(-0.85, 3.35, 0.055, 0.055, 0.045, 0.045, shaftCol, pivot, side, i);
+      // Painted crimson band near blade
+      addOarBox(3.35, 3.62, 0.06, 0.05, 0.08, 0.045, bandCol, pivot, side, i);
+      // Flattened paddle blade
+      addOarBox(3.62, 4.95, 0.13, 0.032, 0.16, 0.022, bladeCol, pivot, side, i);
+    }
+  }
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+  return { buf, count };
+}
+
+// 5. Scrolling Fjord Wall Chunks (Steep Voxel-Terraced Basalt Cliffs, Snow Shelves, Pine Clusters, Waterfalls)
+const CHUNK_LEN = 58;
+const NUM_CHUNKS = 9;
+const TOTAL_FJORD_LEN = CHUNK_LEN * NUM_CHUNKS;
+
+function addLowPolyPine(mb, x, y, z, scale, rng) {
+  const trunkH = 0.9 * scale;
+  mb.frustum(x, y, z, 0.18 * scale, 0.11 * scale, trunkH, 5, [0.24, 0.15, 0.10], 0.0, 0.02, false);
+  const pineBase = [0.09 + rng() * 0.04, 0.21 + rng() * 0.06, 0.15 + rng() * 0.04];
+  const snowTint = [0.82, 0.87, 0.93];
+  const tiers = 3;
+  for (let t = 0; t < tiers; t++) {
+    const ty = y + trunkH * 0.7 + t * 1.15 * scale;
+    const r = (1.35 - t * 0.34) * scale;
+    const h = (1.75 - t * 0.25) * scale;
+    const col = t === 2 && y > 13 ? [lerp(pineBase[0], snowTint[0], 0.35), lerp(pineBase[1], snowTint[1], 0.35), lerp(pineBase[2], snowTint[2], 0.35)] : pineBase;
+    mb.frustum(x, ty, z, r, 0.02, h, 5, col, 0.0, 0.03, false);
+  }
+}
+
+function buildFjordChunk(chunkIndex) {
+  const mb = new MeshBuilder();
+  const rng = mulberry32(1337 + chunkIndex * 919);
+
+  // Seamless periodic noise domain along Z so chunks stitch cleanly!
+  const zSteps = 10;
+  const xSteps = 9;
+  const dz = CHUNK_LEN / zSteps;
+
+  // Compute terrain elevation & channel wall profile
+  const sampleCliff = (side, gx, gzGlobal) => {
+    // Periodic angle along total fjord length so chunk 0 and chunk N-1 match seamlessly
+    const ang = (gzGlobal / TOTAL_FJORD_LEN) * TAU;
+    const n1 = Math.sin(ang * 3.0 + side * 1.4) * 0.5 + 0.5;
+    const n2 = Math.cos(ang * 7.0 - side * 2.1 + gx * 0.42) * 0.5 + 0.5;
+    const n3 = Math.sin(ang * 13.0 + gx * 0.95 + side * 0.7) * 0.5 + 0.5;
+
+    // Winding fjord shoreline (keeps wide clear channel for ship + camera, frames BOTH left & right!)
+    const shoreBase = 26.5 + Math.sin(ang * 2.0 + side * 0.6) * 4.8 + Math.cos(ang * 5.0 + side * 1.8) * 2.5;
+    const channelHalf = shoreBase + (side > 0 ? 1.5 : 0.0);
+
+    const t = gx / (xSteps - 1); // 0 at waterline -> 1 high ridge
+    const xDist = channelHalf + Math.pow(t, 1.22) * 72.0;
+    const x = side * xDist;
+
+    // Dramatic sheer Norwegian fjord walls with subtle voxel-stepped basalt terraces!
+    let h = -2.2;
+    if (gx > 0) {
+      const steepRise = Math.pow(t, 0.76) * (48.0 + n1 * 36.0 + n2 * 20.0);
+      const crag = (n3 - 0.5) * 14.0 * t;
+      let rawH = steepRise + crag;
+      // Subtle voxel-stepped geological strata (not blocky Minecraft, just crisp sculpted shelves)
+      const stepSize = 5.2;
+      const stepped = Math.floor(rawH / stepSize) * stepSize + smoothstep(0.18, 0.82, (rawH % stepSize) / stepSize) * stepSize;
+      h = lerp(rawH, stepped, 0.38);
+    }
+    return [x, h, gzGlobal - chunkIndex * CHUNK_LEN];
+  };
+
+  for (let side of [-1, 1]) {
+    const grid = [];
+    for (let iz = 0; iz <= zSteps; iz++) {
+      const row = [];
+      const gzGlobal = chunkIndex * CHUNK_LEN + iz * dz;
+      for (let ix = 0; ix < xSteps; ix++) {
+        row.push(sampleCliff(side, ix, gzGlobal));
+      }
+      grid.push(row);
+    }
+
+    for (let iz = 0; iz < zSteps; iz++) {
+      for (let ix = 0; ix < xSteps - 1; ix++) {
+        const a = grid[iz][ix];
+        const b = grid[iz][ix + 1];
+        const c = grid[iz + 1][ix + 1];
+        const d = grid[iz + 1][ix];
+
+        const emitFace = (p0, p1, p2) => {
+          const ux = p1[0]-p0[0], uy = p1[1]-p0[1], uz = p1[2]-p0[2];
+          const vx = p2[0]-p0[0], vy = p2[1]-p0[1], vz = p2[2]-p0[2];
+          let ny = uz*vx - ux*vz;
+          const len = Math.hypot(uy*vz - uz*vy, ny, ux*vy - uy*vx) || 1;
+          ny /= len;
+          const avgY = (p0[1] + p1[1] + p2[1]) / 3;
+
+          // Material & color by slope & elevation:
+          // wet dark basalt near water, charcoal-slate vertical cliffs, moss/heather shelves, crisp snowcaps!
+          let col, meta = 0.0;
+          if (avgY < 2.8) {
+            col = [0.13, 0.15, 0.18]; // wet dark shore basalt
+          } else if (avgY > 36.0 && ny > 0.34) {
+            col = [0.92, 0.93, 0.96]; // snowy high peaks
+            meta = 0.75;
+          } else if (avgY > 20.0 && ny > 0.56) {
+            col = [0.86, 0.89, 0.94]; // snow-dusted cliff terrace
+            meta = 0.75;
+          } else if (ny > 0.62 && avgY < 26.0) {
+            col = [0.17, 0.24, 0.18]; // Nordic moss / pine ledge
+          } else if (ny > 0.42) {
+            col = [0.24, 0.26, 0.31]; // granite slope
+          } else {
+            col = [0.19, 0.21, 0.26]; // sheer dark slate cliff face
+          }
+          mb.tri(p0, p1, p2, col, meta, 0.026);
+        };
+
+        if (side > 0) {
+          emitFace(a, d, c);
+          emitFace(a, c, b);
+        } else {
+          emitFace(a, b, c);
+          emitFace(a, c, d);
+        }
+
+        // Plant stylized faceted pine clusters on lower/mid ledges!
+        if (ix >= 1 && ix <= 3 && rng() < 0.36) {
+          const px = (a[0] + b[0] + c[0] + d[0]) * 0.25;
+          const py = (a[1] + b[1] + c[1] + d[1]) * 0.25;
+          const pz = (a[2] + b[2] + c[2] + d[2]) * 0.25;
+          if (py > 2.2 && py < 24.0) {
+            addLowPolyPine(mb, px, py - 0.4, pz, 1.35 + rng() * 1.15, rng);
+          }
+        }
+      }
+    }
+
+    // Occasional dramatic cascading fjord waterfall on sheer cliff face!
+    if ((chunkIndex + (side > 0 ? 1 : 0)) % 3 === 0) {
+      const wiz = 4 + Math.floor(rng() * 3);
+      const topPt = grid[wiz][3];
+      const botPt = grid[wiz][0];
+      const wfW = 1.05;
+      const wfCol = [0.85, 0.93, 0.98];
+      const xTop = topPt[0] - side * 0.6;
+      const xBot = botPt[0] - side * 0.3;
+      const zC = topPt[2];
+      const p0 = [xBot, -0.5, zC - wfW], p1 = [xBot, -0.5, zC + wfW];
+      const p2 = [xTop, topPt[1] - 1.5, zC + wfW * 0.65], p3 = [xTop, topPt[1] - 1.5, zC - wfW * 0.65];
+      if (side > 0) mb.quad(p0, p3, p2, p1, wfCol, 0.95, 0.02);
+      else          mb.quad(p0, p1, p2, p3, wfCol, 0.95, 0.02);
+    }
+
+    // Occasional faceted rocky sea-stack near the shoreline for rich foreground parallax
+    if (rng() < 0.55) {
+      const siz = 2 + Math.floor(rng() * 6);
+      const shorePt = grid[siz][0];
+      const sx = shorePt[0] - side * (2.5 + rng() * 3.5);
+      const sz = shorePt[2];
+      const sh = 3.5 + rng() * 5.5;
+      mb.frustum(sx, -1.5, sz, 2.2 + rng() * 1.6, 0.45, sh, 6, [0.16, 0.18, 0.22], 0.0, 0.03, true);
+      if (sh > 6.5) {
+        mb.frustum(sx, sh - 1.8, sz, 0.95, 0.15, 1.2, 6, [0.88, 0.91, 0.95], 0.75, 0.02, true);
+      }
+    }
+  }
+
+  return mb.upload();
+}
+
+// 6. Distant Majestic Snow-Capped Alpine Peaks (Background Horizon Layer)
+function buildDistantPeaks() {
+  const mb = new MeshBuilder();
+  const rng = mulberry32(4242);
+
+  // Two layered mountain ranges framing the golden-hour sun notch at the far end of the fjord!
+  const peaks = [
+    // Left flank towering alpine massif
+    { x: -165, z: -340, r: 95, h: 128 },
+    { x: -95,  z: -380, r: 78, h: 108 },
+    { x: -48,  z: -415, r: 58, h: 74  },
+    // Far low saddle right under the golden sun so the sun blazes cleanly through the notch!
+    { x: -8,   z: -445, r: 62, h: 42  },
+    // Right flank jagged peaks
+    { x: 46,   z: -410, r: 66, h: 86  },
+    { x: 108,  z: -375, r: 85, h: 122 },
+    { x: 185,  z: -335, r: 102, h: 136 },
+    // Extra distant silhouettes
+    { x: -245, z: -290, r: 110, h: 118 },
+    { x: 255,  z: -285, r: 112, h: 124 },
+  ];
+
+  for (const pk of peaks) {
+    const segs = 7;
+    const rings = 4;
+    const pts = [];
+    for (let r = 0; r <= rings; r++) {
+      const t = r / rings;
+      const rad = pk.r * (1 - t);
+      const y = -6 + Math.pow(t, 0.92) * pk.h;
+      const ring = [];
+      for (let s = 0; s < segs; s++) {
+        const a = (s / segs) * TAU + (r * 0.22);
+        const crag = 0.78 + rng() * 0.44;
+        ring.push([
+          pk.x + Math.cos(a) * rad * crag,
+          y + (r > 0 && r < rings ? (rng() - 0.5) * 9.0 : 0),
+          pk.z + Math.sin(a) * rad * crag * 0.65
+        ]);
+      }
+      pts.push(ring);
+    }
+    const apex = [pk.x + (rng() - 0.5) * 8, pk.h, pk.z];
+
+    for (let r = 0; r < rings; r++) {
+      for (let s = 0; s < segs; s++) {
+        const s1 = (s + 1) % segs;
+        const isSnow = r >= 2;
+        const col = isSnow ? [0.94, 0.93, 0.96] : [0.24, 0.27, 0.36];
+        const meta = isSnow ? 0.75 : 0.0;
+        if (r === rings - 1) {
+          mb.tri(pts[r][s], pts[r][s1], apex, col, meta, 0.025);
+        } else {
+          mb.quad(pts[r][s], pts[r][s1], pts[r+1][s1], pts[r+1][s], col, meta, 0.025);
+        }
+      }
+    }
+  }
+  return mb.upload();
+}
+
+// 7. Animated Faceted Water Grid (Denser near ship, wider toward horizon)
+function buildWaterMesh() {
+  const verts = [];
+  const nx = 68, nz = 92;
+  const xCoords = [];
+  for (let i = 0; i <= nx; i++) {
+    const t = (i / nx) * 2 - 1; // -1..1
+    // Concentrate resolution near channel center for crisp wake & bow facets
+    xCoords.push(Math.sign(t) * Math.pow(Math.abs(t), 1.38) * 62);
+  }
+  const zCoords = [];
+  for (let j = 0; j <= nz; j++) {
+    const t = j / nz; // 0 (foreground +58) -> 1 (horizon -420)
+    // Higher density around ship (-40..+35)
+    zCoords.push(58 - Math.pow(t, 1.65) * 478);
+  }
+
+  for (let j = 0; j < nz; j++) {
+    for (let i = 0; i < nx; i++) {
+      const x0 = xCoords[i], x1 = xCoords[i + 1];
+      const z0 = zCoords[j], z1 = zCoords[j + 1];
+      // Alternating diagonal triangulation for organic low-poly facets!
+      if ((i + j) % 2 === 0) {
+        verts.push(x0, z0,  x1, z0,  x1, z1,  x0, z0,  x1, z1,  x0, z1);
+      } else {
+        verts.push(x0, z0,  x1, z0,  x0, z1,  x1, z0,  x1, z1,  x0, z1);
+      }
+    }
+  }
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+  return { buf, count: verts.length / 2 };
+}
+
+// 8. Low-Poly Wheeling Seabird Mesh (Flapping wings updated per-bird via simple model matrix)
+function buildBirdWing(side) {
+  const mb = new MeshBuilder();
+  const col = [0.92, 0.90, 0.88];
+  const tip = [0.22, 0.24, 0.28];
+  const s = side;
+  mb.tri([0, 0, 0.35], [0, 0, -0.35], [s * 0.9, 0.08, 0.05], col, 0.0, 0.01);
+  mb.tri([s * 0.9, 0.08, 0.05], [0, 0, -0.35], [s * 1.65, -0.05, -0.22], tip, 0.0, 0.01);
+  return mb.upload();
+}
+
+// Build all static GPU geometry
+const shipMesh    = buildVikingShip();
+const sailMesh    = buildSailAndPennant();
+const oarMesh     = buildOars();
+const waterMesh   = buildWaterMesh();
+const peaksMesh   = buildDistantPeaks();
+const fjordChunks = [];
+for (let i = 0; i < NUM_CHUNKS; i++) fjordChunks.push(buildFjordChunk(i));
+const wingLeft    = buildBirdWing(-1);
+const wingRight   = buildBirdWing(1);
+
+// 9. Atmospheric Particles (Golden Mist Motes + Bow Spray)
+const PARTICLE_COUNT = 150;
+const partState = [];
+{
+  const rng = mulberry32(9901);
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const isSpray = i < 48;
+    partState.push({
+      spray: isSpray,
+      x: isSpray ? (rng() - 0.5) * 2.2 : (rng() - 0.5) * 65,
+      y: isSpray ? rng() * 1.6 : 1.0 + rng() * 24,
+      z: isSpray ? 7.2 + rng() * 2.4 : -130 + rng() * 165,
+      vx: isSpray ? (rng() < 0.5 ? -1 : 1) * (1.2 + rng() * 2.4) : (rng() - 0.5) * 0.4,
+      vy: isSpray ? 1.8 + rng() * 2.5 : (rng() - 0.5) * 0.25,
+      vz: isSpray ? -3.5 - rng() * 3.5 : -6.0 - rng() * 4.5,
+      life: rng(),
+      size: isSpray ? 4.5 + rng() * 5.5 : 3.0 + rng() * 6.5
+    });
+  }
+}
+const partBuf = gl.createBuffer();
+const partArray = new Float32Array(PARTICLE_COUNT * 8);
+
+// Seabirds circling high in the golden fjord air
+const birds = [];
+{
+  const rng = mulberry32(7711);
+  for (let i = 0; i < 8; i++) {
+    birds.push({
+      cx: -14 + rng() * 28,
+      cy: 16 + rng() * 14,
+      cz: -45 - rng() * 85,
+      rad: 10 + rng() * 14,
+      speed: 0.24 + rng() * 0.16,
+      phase: rng() * TAU,
+      flap: 4.5 + rng() * 2.2,
+      scale: 0.65 + rng() * 0.45
+    });
+  }
+}
+
+// ---------------- Viewport & Resize ----------------
+let width = 1, height = 1, dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  width = Math.max(1, Math.floor(window.innerWidth * dpr));
+  height = Math.max(1, Math.floor(window.innerHeight * dpr));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  gl.viewport(0, 0, width, height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------------- Helper: Bind Solid Mesh Attributes ----------------
+function drawSolidMesh(mesh, modelMat, offsetVec) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buf);
+  const stride = 40; // 10 floats
+  gl.enableVertexAttribArray(locSolid.a.aPos);
+  gl.vertexAttribPointer(locSolid.a.aPos, 3, gl.FLOAT, false, stride, 0);
+  gl.enableVertexAttribArray(locSolid.a.aNorm);
+  gl.vertexAttribPointer(locSolid.a.aNorm, 3, gl.FLOAT, false, stride, 12);
+  gl.enableVertexAttribArray(locSolid.a.aCol);
+  gl.vertexAttribPointer(locSolid.a.aCol, 3, gl.FLOAT, false, stride, 24);
+  gl.enableVertexAttribArray(locSolid.a.aMeta);
+  gl.vertexAttribPointer(locSolid.a.aMeta, 1, gl.FLOAT, false, stride, 36);
+
+  gl.uniformMatrix4fv(locSolid.u.uModel, false, modelMat);
+  gl.uniform3fv(locSolid.u.uOffset, offsetVec);
+  gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+}
+
+// ---------------- Inverse 4x4 for Sky Ray Direction ----------------
+function mat4Invert(out, a) {
+  const a00=a[0],a01=a[1],a02=a[2],a03=a[3], a10=a[4],a11=a[5],a12=a[6],a13=a[7];
+  const a20=a[8],a21=a[9],a22=a[10],a23=a[11], a30=a[12],a31=a[13],a32=a[14],a33=a[15];
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10;
+  const b03=a01*a12-a02*a11, b04=a01*a13-a03*a11, b05=a02*a13-a03*a12;
+  const b06=a20*a31-a21*a30, b07=a20*a32-a22*a30, b08=a20*a33-a23*a30;
+  const b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  let det = b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06;
+  if (!det) return out;
+  det = 1 / det;
+  out[0]  = (a11*b11 - a12*b10 + a13*b09)*det;
+  out[1]  = (a02*b10 - a01*b11 - a03*b09)*det;
+  out[2]  = (a31*b05 - a32*b04 + a33*b03)*det;
+  out[3]  = (a22*b04 - a21*b05 - a23*b03)*det;
+  out[4]  = (a12*b08 - a10*b11 - a13*b07)*det;
+  out[5]  = (a00*b11 - a02*b08 + a03*b07)*det;
+  out[6]  = (a32*b02 - a30*b05 - a33*b01)*det;
+  out[7]  = (a20*b05 - a22*b02 + a23*b01)*det;
+  out[8]  = (a10*b10 - a11*b08 + a13*b06)*det;
+  out[9]  = (a01*b08 - a00*b10 - a03*b06)*det;
+  out[10] = (a30*b04 - a31*b02 + a33*b00)*det;
+  out[11] = (a21*b02 - a20*b04 - a23*b00)*det;
+  out[12] = (a11*b07 - a10*b09 - a12*b06)*det;
+  out[13] = (a00*b09 - a01*b07 + a02*b06)*det;
+  out[14] = (a31*b01 - a30*b03 - a32*b00)*det;
+  out[15] = (a20*b03 - a21*b01 + a22*b00)*det;
+  return out;
+}
+
+// ---------------- Main Animation Loop ----------------
+const matProj  = mat4Create();
+const matView  = mat4Create();
+const matVP    = mat4Create();
+const matInvVP = mat4Create();
+const matIdent = mat4Create();
+const matShip  = mat4Create();
+const matBird  = mat4Create();
+const ZERO3    = new Float32Array([0, 0, 0]);
+const offset3  = new Float32Array(3);
+
+const SHIP_SPEED = 7.2; // forward sailing speed along fjord
+let lastNow = performance.now();
+let elapsed = 0;
+
+function render(now) {
+  const dt = Math.min((now - lastNow) * 0.001, 0.05);
+  lastNow = now;
+  elapsed += dt;
+
+  const t = elapsed;
+  const worldZ = t * SHIP_SPEED;
+  const rowPhase = t * 2.15; // smooth heroic rowing cadence (~20 strokes/min)
+
+  // Coupled ship bobbing, pitching & gentle rolling in the fjord swells
+  const shipHeave = Math.sin(t * 1.55) * 0.24 + Math.sin(t * 2.35 + 1.1) * 0.10;
+  const shipPitch = Math.cos(t * 1.55) * 0.036 + Math.sin(t * 2.1) * 0.015;
+  const shipRoll  = Math.sin(t * 1.18 + 0.6) * 0.052 + Math.cos(t * 2.4) * 0.016;
+  const shipYaw   = Math.sin(t * 0.45) * 0.025;
+  mat4TRS(matShip, 0, shipHeave, 0, shipPitch, shipYaw, shipRoll);
+
+  // World-space lantern position for warm local ship lighting
+  const lanternPos = [
+    matShip[4] * 2.38 + matShip[8] * 5.45 + matShip[12],
+    matShip[5] * 2.38 + matShip[9] * 5.45 + matShip[13],
+    matShip[6] * 2.38 + matShip[10] * 5.45 + matShip[14]
+  ];
+
+  // Smooth cinematic camera: heroic 3/4 bow-quartering glide framing BOTH fjord walls,
+  // distant snowy peaks, golden sun notch, and the full Viking longship + trailing wake!
+  const camOrbit = Math.sin(t * 0.14);
+  const camX = 11.2 + camOrbit * 2.6 + Math.sin(t * 0.31) * 0.45;
+  const camY = 4.95 + Math.cos(t * 0.19) * 0.85 + Math.sin(t * 0.72) * 0.12;
+  const camZ = 21.8 - camOrbit * 2.0;
+  const camPos = [camX, camY, camZ];
+  const camTarget = [0.4 + camOrbit * 0.7, 4.35, -12.0];
+
+  mat4Perspective(matProj, 48 * Math.PI / 180, width / height, 0.5, 650);
+  mat4LookAt(matView, camPos, camTarget, [0, 1, 0]);
+  mat4Mul(matVP, matProj, matView);
+  mat4Invert(matInvVP, matVP);
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  gl.enable(gl.CULL_FACE);
+  gl.cullFace(gl.BACK);
+  gl.disable(gl.BLEND);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+
+  // 1. Sky Dome + Sun + Volumetric Rays + Clouds
+  gl.depthMask(false);
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(progSky);
+  gl.bindBuffer(gl.ARRAY_BUFFER, skyBuf);
+  gl.enableVertexAttribArray(locSky.a.aPos);
+  gl.vertexAttribPointer(locSky.a.aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.uniformMatrix4fv(locSky.u.uInvVP, false, matInvVP);
+  gl.uniform3fv(locSky.u.uCamPos, camPos);
+  gl.uniform3fv(locSky.u.uSunDir, SUN_DIR);
+  gl.uniform1f(locSky.u.uTime, t);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.depthMask(true);
+
+  // 2. Solid World Pass: Distant Peaks + Scrolling Fjord Walls + Hero Longship + Birds
+  gl.useProgram(progSolid);
+  gl.enable(gl.CULL_FACE);
+  gl.uniformMatrix4fv(locSolid.u.uVP, false, matVP);
+  gl.uniform3fv(locSolid.u.uCamPos, camPos);
+  gl.uniform3fv(locSolid.u.uSunDir, SUN_DIR);
+  gl.uniform3fv(locSolid.u.uLanternPos, lanternPos);
+  gl.uniform1f(locSolid.u.uTime, t);
+
+  // Distant snowy peaks (lighter fog scale so silhouettes stay majestic)
+  gl.uniform1f(locSolid.u.uFogScale, 0.54);
+  drawSolidMesh(peaksMesh, matIdent, ZERO3);
+
+  // Scrolling seamless fjord chunks (moving -Z past the forward-sailing ship!)
+  gl.uniform1f(locSolid.u.uFogScale, 1.0);
+  const zNearWrap = 82;
+  for (let i = 0; i < NUM_CHUNKS; i++) {
+    let cz = i * CHUNK_LEN - (worldZ % TOTAL_FJORD_LEN);
+    // Wrap into [zNearWrap - TOTAL_FJORD_LEN, zNearWrap] so spawning happens unseen behind camera!
+    while (cz > zNearWrap) cz -= TOTAL_FJORD_LEN;
+    while (cz < zNearWrap - TOTAL_FJORD_LEN) cz += TOTAL_FJORD_LEN;
+    offset3[0] = 0; offset3[1] = 0; offset3[2] = cz;
+    drawSolidMesh(fjordChunks[i], matIdent, offset3);
+  }
+
+  // Hero Viking Longship
+  gl.uniform1f(locSolid.u.uFogScale, 0.85);
+  drawSolidMesh(shipMesh, matShip, ZERO3);
+
+  // Wheeling Seabirds in the golden fjord air
+  gl.disable(gl.CULL_FACE);
+  for (const b of birds) {
+    const a = t * b.speed + b.phase;
+    const bx = b.cx + Math.cos(a) * b.rad;
+    const bz = b.cz + Math.sin(a) * b.rad * 0.7;
+    const by = b.cy + Math.sin(a * 2.0) * 1.4;
+    const heading = -a;
+    const flap = Math.sin(t * b.flap + b.phase) * 0.45;
+    mat4TRS(matBird, bx, by, bz, 0, heading, flap, b.scale, b.scale, b.scale);
+    drawSolidMesh(wingLeft, matBird, ZERO3);
+    mat4TRS(matBird, bx, by, bz, 0, heading, -flap, b.scale, b.scale, b.scale);
+    drawSolidMesh(wingRight, matBird, ZERO3);
+  }
+
+  // 3. Synchronized Rowing Oars (16 oars)
+  gl.enable(gl.CULL_FACE);
+  gl.useProgram(progOar);
+  gl.bindBuffer(gl.ARRAY_BUFFER, oarMesh.buf);
+  const oarStride = 56; // 14 floats
+  gl.enableVertexAttribArray(locOar.a.aLocalPos);
+  gl.vertexAttribPointer(locOar.a.aLocalPos, 3, gl.FLOAT, false, oarStride, 0);
+  gl.enableVertexAttribArray(locOar.a.aNorm);
+  gl.vertexAttribPointer(locOar.a.aNorm, 3, gl.FLOAT, false, oarStride, 12);
+  gl.enableVertexAttribArray(locOar.a.aCol);
+  gl.vertexAttribPointer(locOar.a.aCol, 3, gl.FLOAT, false, oarStride, 24);
+  gl.enableVertexAttribArray(locOar.a.aPivot);
+  gl.vertexAttribPointer(locOar.a.aPivot, 3, gl.FLOAT, false, oarStride, 36);
+  gl.enableVertexAttribArray(locOar.a.aOarMeta);
+  gl.vertexAttribPointer(locOar.a.aOarMeta, 2, gl.FLOAT, false, oarStride, 48);
+
+  gl.uniformMatrix4fv(locOar.u.uVP, false, matVP);
+  gl.uniformMatrix4fv(locOar.u.uModel, false, matShip);
+  gl.uniform1f(locOar.u.uRowPhase, rowPhase);
+  gl.uniform3fv(locOar.u.uCamPos, camPos);
+  gl.uniform3fv(locOar.u.uSunDir, SUN_DIR);
+  gl.drawArrays(gl.TRIANGLES, 0, oarMesh.count);
+
+  // 4. Billowing Striped Sail + Fluttering Masthead Pennant
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(progSail);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sailMesh.buf);
+  const sailStride = 36; // 9 floats
+  gl.enableVertexAttribArray(locSail.a.aPos);
+  gl.vertexAttribPointer(locSail.a.aPos, 3, gl.FLOAT, false, sailStride, 0);
+  gl.enableVertexAttribArray(locSail.a.aUv);
+  gl.vertexAttribPointer(locSail.a.aUv, 2, gl.FLOAT, false, sailStride, 12);
+  gl.enableVertexAttribArray(locSail.a.aCol);
+  gl.vertexAttribPointer(locSail.a.aCol, 3, gl.FLOAT, false, sailStride, 20);
+  gl.enableVertexAttribArray(locSail.a.aFlag);
+  gl.vertexAttribPointer(locSail.a.aFlag, 1, gl.FLOAT, false, sailStride, 32);
+
+  gl.uniformMatrix4fv(locSail.u.uVP, false, matVP);
+  gl.uniformMatrix4fv(locSail.u.uModel, false, matShip);
+  gl.uniform1f(locSail.u.uTime, t);
+  gl.uniform3fv(locSail.u.uCamPos, camPos);
+  gl.uniform3fv(locSail.u.uSunDir, SUN_DIR);
+  gl.uniform3fv(locSail.u.uLanternPos, lanternPos);
+  gl.drawArrays(gl.TRIANGLES, 0, sailMesh.count);
+
+  // 5. Animated Dark Faceted Fjord Water + Reflections + Wake
+  gl.useProgram(progWater);
+  gl.bindBuffer(gl.ARRAY_BUFFER, waterMesh.buf);
+  gl.enableVertexAttribArray(locWater.a.aXZ);
+  gl.vertexAttribPointer(locWater.a.aXZ, 2, gl.FLOAT, false, 0, 0);
+
+  gl.uniformMatrix4fv(locWater.u.uVP, false, matVP);
+  gl.uniform1f(locWater.u.uTime, t);
+  gl.uniform1f(locWater.u.uWorldZ, worldZ);
+  gl.uniform3fv(locWater.u.uCamPos, camPos);
+  gl.uniform3fv(locWater.u.uSunDir, SUN_DIR);
+  gl.uniform1f(locWater.u.uRowPhase, rowPhase);
+  gl.drawArrays(gl.TRIANGLES, 0, waterMesh.count);
+
+  // 6. Soft Bow Spray & Golden Atmospheric Motes
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false);
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const p = partState[i];
+    if (p.spray) {
+      p.life += dt * 1.25;
+      if (p.life >= 1) {
+        p.life -= 1;
+        const side = (i % 2 === 0 ? 1 : -1);
+        p.x = side * (0.35 + (i % 7) * 0.12);
+        p.y = 0.25 + shipHeave;
+        p.z = 7.9 + ((i * 17) % 10) * 0.08;
+      }
+      const lt = p.life;
+      const px = p.x + p.vx * lt;
+      const py = p.y + p.vy * lt - 3.6 * lt * lt;
+      const pz = p.z + p.vz * lt;
+      const alpha = Math.sin(lt * Math.PI) * 0.65;
+      const o = i * 8;
+      partArray[o] = px; partArray[o+1] = Math.max(0.05, py); partArray[o+2] = pz;
+      partArray[o+3] = 0.96; partArray[o+4] = 0.94; partArray[o+5] = 0.88; partArray[o+6] = alpha;
+      partArray[o+7] = p.size * (0.6 + lt * 0.8);
+    } else {
+      p.z += p.vz * dt;
+      p.x += Math.sin(t * 0.6 + i) * 0.35 * dt;
+      p.y += Math.cos(t * 0.4 + i * 1.3) * 0.22 * dt;
+      if (p.z < -130) p.z += 165;
+      const o = i * 8;
+      partArray[o] = p.x; partArray[o+1] = p.y; partArray[o+2] = p.z;
+      partArray[o+3] = 1.0; partArray[o+4] = 0.82; partArray[o+5] = 0.52;
+      partArray[o+6] = 0.26 * (0.5 + 0.5 * Math.sin(t * 1.5 + i));
+      partArray[o+7] = p.size;
+    }
+  }
+
+  gl.useProgram(progParticle);
+  gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, partArray, gl.DYNAMIC_DRAW);
+  const pStride = 32;
+  gl.enableVertexAttribArray(locPart.a.aPos);
+  gl.vertexAttribPointer(locPart.a.aPos, 3, gl.FLOAT, false, pStride, 0);
+  gl.enableVertexAttribArray(locPart.a.aCol);
+  gl.vertexAttribPointer(locPart.a.aCol, 4, gl.FLOAT, false, pStride, 12);
+  gl.enableVertexAttribArray(locPart.a.aSize);
+  gl.vertexAttribPointer(locPart.a.aSize, 1, gl.FLOAT, false, pStride, 28);
+
+  gl.uniformMatrix4fv(locPart.u.uVP, false, matVP);
+  gl.uniform1f(locPart.u.uPixelRatio, dpr);
+  gl.drawArrays(gl.POINTS, 0, PARTICLE_COUNT);
+
+  gl.depthMask(true);
+  gl.disable(gl.BLEND);
+
+  requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>

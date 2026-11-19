@@ -22,6 +22,9 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 | 2026-11-13 | Grok 4.7 | [scenes/grok-4.7.html](scenes/grok-4.7.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/grok-4.7.html) |
 | 2026-11-16 | Qwen 4 Max | [scenes/qwen-4-max.html](scenes/qwen-4-max.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/qwen-4-max.html) |
 | 2026-11-16 | HY4 Flash (free) | [scenes/hy4-flash.html](scenes/hy4-flash.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/hy4-flash.html) |
+| 2026-11-18 | GPT-6.2 Sol | [scenes/gpt-6.2-sol.html](scenes/gpt-6.2-sol.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/gpt-6.2-sol.html) |
+| 2026-11-18 | GPT-6.2 Astra | [scenes/gpt-6.2-astra.html](scenes/gpt-6.2-astra.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/gpt-6.2-astra.html) |
+| 2026-11-18 | Gemini 4 Neon | [scenes/gemini-4-neon.html](scenes/gemini-4-neon.html) | [▶ play](https://darthjml.github.io/viking-fjord-bench/scenes/gemini-4-neon.html) |
 
 ## Honest notes
 - Not a strict one-shot benchmark: some earlier entries had runtime repairs, and retests used corrected model IDs.
@@ -34,5 +37,8 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 - Grok 4.7 (2026-11-13) was stopped during its own self-verification; the file is as it was written at that point and was checked headless afterwards (longship, sail, shields, scene motion, no console errors).
 - Qwen 4 Max (2026-11-16, Nous Portal, the day after it launched) is a single unassisted run: 63 model calls over about 68 minutes, self-checked with its own headless renders, no repairs by us. An earlier attempt was cut off by a 5-minute timer and produced nothing.
 - HY4 Flash (2026-11-16, the free tier on Nous Portal) is a single unassisted run: 26 model calls in under 5 minutes, no repairs. It has no shield row along the hull.
+- GPT-6.2 Sol (2026-11-18) is a single run with no repair round: a 30 KB file, about 14 minutes, 34 model calls. An earlier attempt was silently served by a fallback model, so it doesn't count and isn't published.
+- GPT-6.2 Astra (2026-11-18) is a single run with no repair round: a 12 KB file, about 3.6 minutes, 8 model calls.
+- Gemini 4 Neon (2026-11-18) is a one-shot with no repairs: a 73 KB file, about 8.6 minutes, 14 tool calls.
 
 Made by [@DarthJML](https://x.com/DarthJML) with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
