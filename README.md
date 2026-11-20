@@ -46,3 +46,7 @@ Made by [@DarthJML](https://x.com/DarthJML) with [Hermes Agent](https://github.c
 ## CAD Bench
 
 Round 1: four models design the same printable Viking shield phone stand from one fixed OpenSCAD prompt. Renders, STL/.scad files and the rubric: [cad-bench/](https://darthjml.github.io/viking-fjord-bench/cad-bench/)
+
+## Videos
+
+Gemini 4 Neon bench videos: [videos/](https://darthjml.github.io/viking-fjord-bench/videos/)
