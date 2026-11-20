@@ -1,0 +1,19 @@
+Write one OpenSCAD file: a parametric Viking round-shield phone stand — a desk stand that holds a phone (in its case) at a comfortable viewing recline while looking like a Viking round shield. It should be a real, printable, useful object, not a visual joke.
+
+Functional requirements:
+- Holds a typical phone in a case (default about 76 mm wide, 11.5 mm thick) upright and stable on a desk, screen reclined about 15 degrees from vertical.
+- A bottom lip catches the phone so it cannot slide out.
+- The phone can charge while docked: leave a way for the cable to reach the phone's bottom-edge port.
+- Decorative but honest: from across the desk it should read unmistakably as a Viking round shield (disc, raised rim, central boss).
+- Single-piece print, ordinary FDM printer, 0.4 mm nozzle, no supports, fits a 220 x 220 mm bed.
+
+Hard requirements:
+- Exactly one .scad file. Pure OpenSCAD, no external libraries or includes.
+- All dimensions parametric: every magic number is a named, commented parameter (phone size, shield diameter, recline angle, clearances, cable pocket, and so on). Changing phone_t alone must correctly resize the phone channel.
+- Units mm. $fn >= 64 for the final shape.
+- Manifold intent: `openscad -o part.stl part.scad` must export a watertight STL with no errors.
+- Walls >= 2.4 mm, minimum feature >= 0.8 mm. State your intended print orientation and why it needs no supports.
+- Document your fits: which surfaces touch the phone, what tolerance you left where, and why (FDM, 0.4 mm nozzle).
+- Header comment must include: print orientation, a slicing suggestion (layer height, infill), and an estimated print time + material weight clearly marked ESTIMATE.
+
+Before finishing, check that the geometry is coherent: the phone actually rests fully against the backrest with its bottom edge seated and caught by the lip, the shield does not collide with the phone, the cable path actually reaches the port, nothing needs supports, and the part stands stable on a desk. Report the exact file path and what you verified. Pick your own construction; do not copy another model's file.

@@ -42,3 +42,7 @@ The exact prompt is in [PROMPT.txt](PROMPT.txt).
 - Gemini 4 Neon (2026-11-18) is a one-shot with no repairs: a 73 KB file, about 8.6 minutes, 14 tool calls.
 
 Made by [@DarthJML](https://x.com/DarthJML) with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+
+## CAD Bench
+
+Round 1: four models design the same printable Viking shield phone stand from one fixed OpenSCAD prompt. Renders, STL/.scad files and the rubric: [cad-bench/](https://darthjml.github.io/viking-fjord-bench/cad-bench/)
